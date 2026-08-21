@@ -1,6 +1,7 @@
-# 二进制产物
-niulai
-niulai-wecom-bot
+# 二进制产物（锚定根目录，避免误伤 cmd/niulai 源码目录）
+/niulai
+/niulai-wecom-bot
+/build/
 
 # Go
 *.exe
