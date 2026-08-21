@@ -77,6 +77,12 @@ type MsgCallbackBody struct {
 	Mention  []Mention `json:"mention,omitempty"`
 }
 
+// EventCallbackBody 是 aibot_event_callback 的 body，仅提取群聊发现所需字段
+type EventCallbackBody struct {
+	ChatID   string `json:"chatid"`
+	ChatType string `json:"chattype"`
+}
+
 // MsgFrom 是消息发送者
 type MsgFrom struct {
 	UserID string `json:"userid"`
@@ -97,6 +103,8 @@ type Mention struct {
 type Handler interface {
 	// OnMessage 在收到用户消息时调用，reqID 用于被动回复
 	OnMessage(reqID string, body *MsgCallbackBody)
+	// OnEvent 在收到事件回调时调用，用于群聊发现等场景
+	OnEvent(body *EventCallbackBody)
 }
 
 // Client 是企业微信智能机器人的 WebSocket 客户端
@@ -182,10 +190,16 @@ func (c *Client) connectAndServe(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("dial: %w", err)
 	}
+
+	c.mu.Lock()
 	c.conn = conn
+	c.mu.Unlock()
+
 	defer func() {
-		_ = conn.Close()
+		c.mu.Lock()
 		c.conn = nil
+		c.mu.Unlock()
+		_ = conn.Close()
 	}()
 
 	// 父 context 取消时强制关闭连接，中断阻塞的 ReadJSON
@@ -300,7 +314,15 @@ func (c *Client) handleFrame(frame Frame) {
 			c.handler.OnMessage(frame.Headers.ReqID, &body)
 		}
 	case "aibot_event_callback":
-		c.logger.Debug("event callback received", "body", string(frame.Body))
+		var body EventCallbackBody
+		if err := json.Unmarshal(frame.Body, &body); err != nil {
+			c.logger.Warn("unmarshal event callback", "err", err)
+			return
+		}
+		c.logger.Debug("event callback received", "chatid", body.ChatID, "chattype", body.ChatType)
+		if c.handler != nil {
+			c.handler.OnEvent(&body)
+		}
 	case "pong", "":
 		// 忽略心跳响应和裸响应帧
 	default:

@@ -25,6 +25,7 @@ type Scheduler struct {
 	// running 用原子操作防止多次启动
 	running atomic.Bool
 
+	stopMu   sync.Mutex
 	stopCh   chan struct{}
 	stopOnce sync.Once
 }
@@ -43,12 +44,17 @@ func New(cfg *config.Config, machine *state.Machine, onTrigger func()) *Schedule
 	}
 }
 
-// Start 启动调度循环
+// Start 启动调度循环，可多次调用，每次调用都会重置停止状态
 func (s *Scheduler) Start(ctx context.Context) {
 	if !s.running.CompareAndSwap(false, true) {
 		return
 	}
 	defer s.running.Store(false)
+
+	s.stopMu.Lock()
+	s.stopCh = make(chan struct{})
+	s.stopOnce = sync.Once{}
+	s.stopMu.Unlock()
 
 	ticker := time.NewTicker(s.checkEvery)
 	defer ticker.Stop()
@@ -68,10 +74,14 @@ func (s *Scheduler) Start(ctx context.Context) {
 	}
 }
 
-// Stop 停止调度循环，可安全重复调用
+// Stop 停止调度循环，可安全重复调用；调用后仍可再次 Start
 func (s *Scheduler) Stop() {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
 	s.stopOnce.Do(func() {
-		close(s.stopCh)
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
 	})
 }
 

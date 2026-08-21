@@ -20,12 +20,17 @@ type testHandler struct {
 	called atomic.Bool
 	reqID  string
 	body   *MsgCallbackBody
+	event  *EventCallbackBody
 }
 
 func (h *testHandler) OnMessage(reqID string, body *MsgCallbackBody) {
 	h.called.Store(true)
 	h.reqID = reqID
 	h.body = body
+}
+
+func (h *testHandler) OnEvent(body *EventCallbackBody) {
+	h.event = body
 }
 
 func TestClientAuthAndReceiveMessage(t *testing.T) {
@@ -141,6 +146,84 @@ func TestClientAuthAndReceiveMessage(t *testing.T) {
 	}
 	if handler.body == nil || handler.body.MsgID != "msg-1" {
 		t.Fatalf("unexpected body: %+v", handler.body)
+	}
+}
+
+func TestClientEventCallbackIsDelivered(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	var (
+		connected = make(chan struct{})
+		once      sync.Once
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		var authReq Frame
+		if err := conn.ReadJSON(&authReq); err != nil {
+			return
+		}
+		if err := conn.WriteJSON(Frame{Cmd: "aibot_subscribe", ErrCode: 0}); err != nil {
+			t.Errorf("write auth resp: %v", err)
+			return
+		}
+		once.Do(func() { close(connected) })
+
+		event := Frame{
+			Cmd:     "aibot_event_callback",
+			Headers: Headers{ReqID: "req-event"},
+			Body:    mustMarshal(t, EventCallbackBody{ChatID: "chat-event", ChatType: "group"}),
+		}
+		if err := conn.WriteJSON(event); err != nil {
+			t.Errorf("write event callback: %v", err)
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
+	handler := &testHandler{}
+	client := NewClient("bot-id", "secret", handler, logger).SetURL(wsTestURL(t, server))
+
+	var runWG sync.WaitGroup
+	runWG.Add(1)
+	go func() {
+		defer runWG.Done()
+		_ = client.Run(ctx)
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		cancel()
+		runWG.Wait()
+		t.Fatal("client did not connect in time")
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	runWG.Wait()
+
+	if handler.event == nil {
+		t.Fatal("event handler was not called")
+	}
+	if handler.event.ChatID != "chat-event" || handler.event.ChatType != "group" {
+		t.Fatalf("unexpected event body: %+v", handler.event)
 	}
 }
 

@@ -2,12 +2,11 @@ package bot
 
 import (
 	"context"
+	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
-
-	"log/slog"
-	"os"
 
 	"niulai-wecom-bot/internal/config"
 	"niulai-wecom-bot/internal/state"
@@ -15,11 +14,10 @@ import (
 )
 
 type fakeSender struct {
-	mu          sync.Mutex
-	sends       []sendCall
-	responds    []respondCall
-	failSend    bool
-	failRespond bool
+	mu       sync.Mutex
+	sends    []sendCall
+	responds []respondCall
+	failSend bool
 }
 
 type sendCall struct {
@@ -44,9 +42,6 @@ func (f *fakeSender) SendMarkdown(chatID string, chatType uint32, content string
 }
 
 func (f *fakeSender) RespondMarkdown(reqID, content string) error {
-	if f.failRespond {
-		return errTest()
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.responds = append(f.responds, respondCall{reqID: reqID, content: content})
@@ -127,6 +122,26 @@ func TestIsStopCommand(t *testing.T) {
 			},
 			want: true,
 		},
+		{
+			name: "keyword with spaces",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				AIBotID: "bot-1",
+				Text:    wecom.TextBody{Content: "  牛 来  "},
+				Mention: []wecom.Mention{{UserID: "bot-1", Type: 1}},
+			},
+			want: true,
+		},
+		{
+			name: "keyword with full-width and zero-width spaces",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				AIBotID: "bot-1",
+				Text:    wecom.TextBody{Content: "　牛​来 "},
+				Mention: []wecom.Mention{{UserID: "bot-1", Type: 1}},
+			},
+			want: true,
+		},
 	}
 
 	for _, c := range cases {
@@ -139,7 +154,7 @@ func TestIsStopCommand(t *testing.T) {
 	}
 }
 
-func TestAutoCaptureChatID(t *testing.T) {
+func TestCaptureMultipleChatIDs(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	nl := New(&config.Config{CooldownMinutes: 1}, nil, logger)
 
@@ -149,30 +164,53 @@ func TestAutoCaptureChatID(t *testing.T) {
 		MsgType:  "text",
 		Text:     wecom.TextBody{Content: "hello"},
 	})
-
-	if got := nl.currentChatID(); got != "chat-1" {
-		t.Fatalf("currentChatID = %q, want chat-1", got)
-	}
-
-	// 第二次不应覆盖
 	nl.OnMessage("", &wecom.MsgCallbackBody{
 		ChatType: "group",
 		ChatID:   "chat-2",
 		MsgType:  "text",
 		Text:     wecom.TextBody{Content: "hello"},
 	})
-	if got := nl.currentChatID(); got != "chat-1" {
-		t.Fatalf("currentChatID = %q, want chat-1", got)
+	nl.OnEvent(&wecom.EventCallbackBody{ChatType: "group", ChatID: "chat-3"})
+
+	got := nl.targetChatIDs()
+	want := map[string]struct{}{"chat-1": {}, "chat-2": {}, "chat-3": {}}
+	if len(got) != len(want) {
+		t.Fatalf("targetChatIDs = %v, want length %d", got, len(want))
+	}
+	for _, id := range got {
+		if _, ok := want[id]; !ok {
+			t.Fatalf("unexpected chatid %q", id)
+		}
 	}
 }
 
-func TestStopCommandStartsCooldown(t *testing.T) {
+func TestTargetChatIDPrefersConfig(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	cfg := &config.Config{
+		CooldownMinutes: 1,
+		TargetChatID:    "target-chat",
+	}
+	nl := New(cfg, nil, logger)
+
+	nl.OnMessage("", &wecom.MsgCallbackBody{
+		ChatType: "group",
+		ChatID:   "chat-1",
+		MsgType:  "text",
+		Text:     wecom.TextBody{Content: "hello"},
+	})
+
+	got := nl.targetChatIDs()
+	if len(got) != 1 || got[0] != "target-chat" {
+		t.Fatalf("targetChatIDs = %v, want [target-chat]", got)
+	}
+}
+
+func TestStopCommandStartsCooldownWithoutReply(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	fake := &fakeSender{}
 	nl := New(&config.Config{CooldownMinutes: 1}, fake, logger)
 	nl.SetClient(fake)
 
-	// 先进入尖叫状态
 	if !nl.machine.StartScreaming() {
 		t.Fatal("failed to start screaming")
 	}
@@ -191,22 +229,24 @@ func TestStopCommandStartsCooldown(t *testing.T) {
 	}
 
 	fake.mu.Lock()
-	if len(fake.responds) != 1 || fake.responds[0].content != stopConfirmText {
-		t.Fatalf("unexpected responds: %+v", fake.responds)
+	if len(fake.responds) != 0 {
+		t.Fatalf("expected no respond, got %+v", fake.responds)
 	}
 	fake.mu.Unlock()
 }
 
-func TestScreamLoopStopsImmediately(t *testing.T) {
+func TestScreamLoopSendsToMultipleChats(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	fake := &fakeSender{}
 	cfg := &config.Config{
 		CooldownMinutes:    1,
-		MinIntervalSeconds: 600, // 很长，确保 stop 信号能打断
+		MinIntervalSeconds: 600,
 		MaxIntervalSeconds: 600,
 	}
 	nl := New(cfg, fake, logger)
 	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+	nl.captureChatID("group", "chat-2")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	nl.ctx, nl.cancel = ctx, cancel
@@ -215,25 +255,16 @@ func TestScreamLoopStopsImmediately(t *testing.T) {
 		t.Fatal("failed to start screaming")
 	}
 
-	stopCh := make(chan struct{})
-	session := &screamSession{
-		chatID:   "chat-1",
-		chatType: wecom.ChatTypeGroup,
-		stopCh:   stopCh,
-	}
+	screamCtx, screamCancel := context.WithCancel(nl.ctx)
 
 	nl.wg.Add(1)
 	go func() {
 		defer nl.wg.Done()
-		nl.screamLoop(session)
+		nl.screamLoop(screamCtx)
 	}()
 
-	// 给它一点时间开始循环
 	time.Sleep(50 * time.Millisecond)
-
-	// 模拟停止指令：切换状态并发出停止信号
-	nl.machine.StopScreaming(time.Minute)
-	close(stopCh)
+	screamCancel()
 
 	done := make(chan struct{})
 	go func() {
@@ -249,9 +280,18 @@ func TestScreamLoopStopsImmediately(t *testing.T) {
 
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	// 至少发送了一次“妈妈”，但不会持续发送
 	if len(fake.sends) == 0 {
 		t.Fatal("expected at least one scream message")
+	}
+	seen := make(map[string]struct{})
+	for _, c := range fake.sends {
+		seen[c.chatID] = struct{}{}
+		if c.content != screamContent {
+			t.Fatalf("unexpected content: %q", c.content)
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("expected messages to both chats, got chats: %v", seen)
 	}
 }
 
@@ -274,21 +314,16 @@ func TestScreamLoopUsesTargetChatID(t *testing.T) {
 		t.Fatal("failed to start screaming")
 	}
 
-	stopCh := make(chan struct{})
-	session := &screamSession{
-		chatID:   nl.currentChatID(),
-		chatType: wecom.ChatTypeGroup,
-		stopCh:   stopCh,
-	}
+	screamCtx, screamCancel := context.WithCancel(nl.ctx)
 
 	nl.wg.Add(1)
 	go func() {
 		defer nl.wg.Done()
-		nl.screamLoop(session)
+		nl.screamLoop(screamCtx)
 	}()
 
 	time.Sleep(150 * time.Millisecond)
-	close(stopCh)
+	screamCancel()
 	nl.wg.Wait()
 
 	fake.mu.Lock()
@@ -304,4 +339,101 @@ func TestScreamLoopUsesTargetChatID(t *testing.T) {
 			t.Fatalf("unexpected content: %q", c.content)
 		}
 	}
+}
+
+func TestFailureEviction(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{failSend: true}
+	cfg := &config.Config{
+		CooldownMinutes:    1,
+		MinIntervalSeconds: 1,
+		MaxIntervalSeconds: 1,
+		MaxSendFailures:    2,
+	}
+	nl := New(cfg, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+	nl.captureChatID("group", "chat-2")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	nl.ctx, nl.cancel = ctx, cancel
+
+	if !nl.machine.StartScreaming() {
+		t.Fatal("failed to start screaming")
+	}
+
+	screamCtx, screamCancel := context.WithCancel(nl.ctx)
+
+	nl.wg.Add(1)
+	go func() {
+		defer nl.wg.Done()
+		nl.screamLoop(screamCtx)
+	}()
+
+	time.Sleep(1100 * time.Millisecond)
+	screamCancel()
+	nl.wg.Wait()
+
+	// chat-1 应该因连续失败 2 次被移除
+	nl.chatsMu.RLock()
+	_, ok := nl.chats["chat-1"]
+	nl.chatsMu.RUnlock()
+	if ok {
+		t.Fatal("expected chat-1 to be evicted after failures")
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.sends) != 0 {
+		t.Fatal("expected all sends to fail")
+	}
+}
+
+func TestFailureResetOnSuccess(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	nl.sendScreamToTargets(context.Background())
+	if nl.getSendFailures("chat-1") != 0 {
+		t.Fatalf("expected failures reset to 0, got %d", nl.getSendFailures("chat-1"))
+	}
+}
+
+func TestConfiguredTargetTracksFailures(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{failSend: true}
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3, TargetChatID: "target-chat"}, fake, logger)
+	nl.SetClient(fake)
+
+	nl.sendScreamToTargets(context.Background())
+	if nl.getSendFailures("target-chat") != 1 {
+		t.Fatalf("expected configured target failures = 1, got %d", nl.getSendFailures("target-chat"))
+	}
+
+	// 配置的目标不会被驱逐
+	nl.chatsMu.RLock()
+	_, ok := nl.chats["target-chat"]
+	nl.chatsMu.RUnlock()
+	if ok {
+		t.Fatal("configured target should not be in auto-discovered chats")
+	}
+}
+
+func TestStartIsIdempotent(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	nl := New(&config.Config{CooldownMinutes: 1}, nil, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	nl.Start(ctx)
+	nl.Start(ctx) // 第二次应被忽略，不应 panic 或泄漏
+
+	// 给调度器一点时间启动
+	time.Sleep(50 * time.Millisecond)
+	nl.Stop()
+	nl.Stop() // 重复 Stop 应安全
 }

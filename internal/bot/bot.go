@@ -5,7 +5,9 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 
 	"niulai-wecom-bot/internal/config"
 	"niulai-wecom-bot/internal/scheduler"
@@ -14,9 +16,9 @@ import (
 )
 
 const (
-	screamContent   = "妈妈"
-	stopConfirmText = "好的，我安静了"
-	triggerKeyword  = "牛来"
+	screamContent  = "妈妈"
+	triggerKeyword = "牛来"
+	zeroWidthSpace = '\u200B'
 )
 
 // Sender 是 bot 对外发送消息所需的最小接口，便于测试与解耦
@@ -33,43 +35,64 @@ type NiuLai struct {
 	scheduler *scheduler.Scheduler
 	logger    *slog.Logger
 
-	// activeChat 是运行时自动发现的活跃会话
-	// 当 TARGET_CHAT_ID 为空时，从首次收到的群消息回调中获取
-	activeChatMu sync.RWMutex
-	activeChatID string
+	// chats 是运行时自动发现的活跃群聊集合
+	// 当没有配置 TARGET_CHAT_ID 时，从收到的群消息/事件回调中收集
+	chatsMu sync.RWMutex
+	chats   map[string]struct{}
 
-	// screamStop 用于唤醒 screamLoop 以便立即停止发送
-	screamMu   sync.Mutex
-	screamStop chan struct{}
+	// failures 记录每个 chatid 的连续发送失败次数，与是否自动发现无关
+	failuresMu sync.Mutex
+	failures   map[string]int
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-}
+	// screamCtx/screamCancel 控制当前 SCREAMING 会话的生命周期
+	screamMu     sync.Mutex
+	screamCtx    context.Context
+	screamCancel context.CancelFunc
 
-// screamSession 表示一次 SCREAMING 会话的上下文
-// 由 onTrigger 创建并传递给 screamLoop，确保生命周期清晰
-type screamSession struct {
-	chatID   string
-	chatType uint32
-	stopCh   chan struct{}
+	// sleep 控制 screamLoop 的等待行为，便于测试注入
+	sleep func(context.Context, time.Duration) bool
+
+	running atomic.Bool
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
 }
 
 // New 创建一个新的牛来实例
 func New(cfg *config.Config, client Sender, logger *slog.Logger) *NiuLai {
 	machine := state.NewMachine()
 	nl := &NiuLai{
-		cfg:     cfg,
-		machine: machine,
-		client:  client,
-		logger:  logger,
+		cfg:      cfg,
+		machine:  machine,
+		client:   client,
+		logger:   logger,
+		chats:    make(map[string]struct{}),
+		failures: make(map[string]int),
+		sleep:    ctxSleep,
 	}
+	// 默认上下文，避免测试绕过 Start 时访问 nil ctx
+	nl.ctx = context.Background()
 	nl.scheduler = scheduler.New(cfg, machine, nl.onTrigger)
 	return nl
 }
 
-// Start 启动牛来的调度循环
+// ctxSleep 是 screamLoop 默认的等待实现，可被测试替换
+func ctxSleep(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// Start 启动牛来的调度循环；已启动时直接返回
 func (nl *NiuLai) Start(ctx context.Context) {
+	if !nl.running.CompareAndSwap(false, true) {
+		nl.logger.Warn("niulai already started")
+		return
+	}
+
 	nl.ctx, nl.cancel = context.WithCancel(ctx)
 
 	nl.wg.Add(1)
@@ -84,16 +107,21 @@ func (nl *NiuLai) Start(ctx context.Context) {
 		"min_interval", nl.cfg.MinIntervalSeconds,
 		"max_interval", nl.cfg.MaxIntervalSeconds,
 		"cooldown_minutes", nl.cfg.CooldownMinutes,
+		"max_send_failures", nl.cfg.MaxSendFailures,
 	)
 }
 
 // Stop 停止牛来，等待 goroutine 退出
 func (nl *NiuLai) Stop() {
+	if !nl.running.CompareAndSwap(true, false) {
+		return
+	}
+
 	if nl.cancel != nil {
 		nl.cancel()
 	}
 	nl.scheduler.Stop()
-	nl.signalScreamStop()
+	nl.cancelScream()
 	nl.wg.Wait()
 	nl.logger.Info("niulai stopped")
 }
@@ -109,28 +137,21 @@ func (nl *NiuLai) OnMessage(reqID string, body *wecom.MsgCallbackBody) {
 		return
 	}
 
+	logAttrs := []any{
+		"msgid", body.MsgID,
+		"chatid", body.ChatID,
+		"chattype", body.ChatType,
+		"from", body.From.UserID,
+		"msgtype", body.MsgType,
+	}
 	// 仅在文本消息时记录内容，避免非文本消息日志为空
 	if body.MsgType == "text" {
-		nl.logger.Debug("message received",
-			"msgid", body.MsgID,
-			"chatid", body.ChatID,
-			"chattype", body.ChatType,
-			"from", body.From.UserID,
-			"msgtype", body.MsgType,
-			"content", body.Text.Content,
-		)
-	} else {
-		nl.logger.Debug("message received",
-			"msgid", body.MsgID,
-			"chatid", body.ChatID,
-			"chattype", body.ChatType,
-			"from", body.From.UserID,
-			"msgtype", body.MsgType,
-		)
+		logAttrs = append(logAttrs, "content", body.Text.Content)
 	}
+	nl.logger.Debug("message received", logAttrs...)
 
-	// 自动发现目标群：当没有配置 TARGET_CHAT_ID 时，把首次收到的群消息 chatid 记下来
-	nl.maybeCaptureChatID(body)
+	// 自动发现目标群：从任何群消息或群事件回调中收集 chatid
+	nl.captureChatID(body.ChatType, body.ChatID)
 
 	// 去重、幂等可由调用方自行维护 msgid 集合
 	// 这里只关注停止指令
@@ -144,49 +165,63 @@ func (nl *NiuLai) OnMessage(reqID string, body *wecom.MsgCallbackBody) {
 		return
 	}
 
-	nl.signalScreamStop()
+	nl.cancelScream()
 
 	nl.logger.Info("stop command accepted", "from", body.From.UserID, "chatid", body.ChatID)
-
-	// 被动回复确认
-	if reqID != "" && nl.client != nil {
-		if err := nl.client.RespondMarkdown(reqID, stopConfirmText); err != nil {
-			nl.logger.Warn("failed to send stop confirmation", "err", err)
-		}
-	}
 }
 
-func (nl *NiuLai) maybeCaptureChatID(body *wecom.MsgCallbackBody) {
-	if body.ChatType != "group" || body.ChatID == "" {
+// OnEvent 实现 wecom.Handler，从事件回调中发现群聊
+func (nl *NiuLai) OnEvent(body *wecom.EventCallbackBody) {
+	if body == nil {
+		return
+	}
+	nl.captureChatID(body.ChatType, body.ChatID)
+}
+
+func (nl *NiuLai) captureChatID(chatType, chatID string) {
+	if chatType != "group" || chatID == "" {
 		return
 	}
 
-	nl.activeChatMu.Lock()
-	defer nl.activeChatMu.Unlock()
+	nl.chatsMu.Lock()
+	defer nl.chatsMu.Unlock()
 
-	if nl.activeChatID != "" {
+	if _, ok := nl.chats[chatID]; ok {
 		return
 	}
 
-	nl.activeChatID = body.ChatID
-	nl.logger.Info("auto-captured target group chatid", "chatid", nl.activeChatID)
+	nl.chats[chatID] = struct{}{}
+	nl.logger.Info("auto-captured target group chatid", "chatid", chatID)
 }
 
-func (nl *NiuLai) currentChatID() string {
-	nl.activeChatMu.RLock()
-	defer nl.activeChatMu.RUnlock()
-
-	if nl.activeChatID != "" {
-		return nl.activeChatID
+// targetChatIDs 返回当前需要发送消息的群聊 ID 列表
+// 如果配置了 TARGET_CHAT_ID，则优先使用配置值；否则使用运行时收集的群聊列表
+func (nl *NiuLai) targetChatIDs() []string {
+	if nl.cfg.TargetChatID != "" {
+		return []string{nl.cfg.TargetChatID}
 	}
-	return nl.cfg.TargetChatID
+
+	nl.chatsMu.RLock()
+	defer nl.chatsMu.RUnlock()
+
+	if len(nl.chats) == 0 {
+		return nil
+	}
+
+	ids := make([]string, 0, len(nl.chats))
+	for id := range nl.chats {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func (nl *NiuLai) isStopCommand(body *wecom.MsgCallbackBody) bool {
 	if body.MsgType != "text" {
 		return false
 	}
-	content := strings.TrimSpace(body.Text.Content)
+	// 去除所有 Unicode 空白字符（包括普通空格、Tab、全角空格、
+	// 不间断空格、零宽空格等），避免用户输入时夹杂特殊空白导致无法识别。
+	content := strings.Join(strings.FieldsFunc(body.Text.Content, isSpaceLike), "")
 	if content == "" {
 		return false
 	}
@@ -222,44 +257,43 @@ func (nl *NiuLai) onTrigger() {
 
 	nl.logger.Info("event triggered, start screaming")
 
-	chatID := nl.currentChatID()
-	chatType := wecom.ChatTypeGroup
-	if chatID == "" {
-		nl.logger.Warn("no TARGET_CHAT_ID configured, screaming will not send messages")
-	}
-
-	session := nl.newScreamSession(chatID, chatType)
+	screamCtx := nl.startScreamCtx()
 
 	nl.wg.Add(1)
 	go func() {
 		defer nl.wg.Done()
-		nl.screamLoop(session)
+		nl.screamLoop(screamCtx)
 	}()
 }
 
-func (nl *NiuLai) newScreamSession(chatID string, chatType uint32) *screamSession {
+// startScreamCtx 创建新的 SCREAMING 上下文，并取消旧的上下文
+func (nl *NiuLai) startScreamCtx() context.Context {
 	nl.screamMu.Lock()
 	defer nl.screamMu.Unlock()
 
-	// 关闭旧的停止通道（如果存在），确保上一个 screamLoop 立即退出
-	if nl.screamStop != nil {
-		close(nl.screamStop)
+	if nl.screamCancel != nil {
+		nl.screamCancel()
 	}
-	nl.screamStop = make(chan struct{})
+	nl.screamCtx, nl.screamCancel = context.WithCancel(nl.ctx)
+	return nl.screamCtx
+}
 
-	return &screamSession{
-		chatID:   chatID,
-		chatType: chatType,
-		stopCh:   nl.screamStop,
+// cancelScream 取消当前 SCREAMING 上下文
+func (nl *NiuLai) cancelScream() {
+	nl.screamMu.Lock()
+	defer nl.screamMu.Unlock()
+	if nl.screamCancel != nil {
+		nl.screamCancel()
+		nl.screamCancel = nil
 	}
 }
 
-func (nl *NiuLai) screamLoop(session *screamSession) {
+func (nl *NiuLai) screamLoop(ctx context.Context) {
 	for {
 		select {
 		case <-nl.ctx.Done():
 			return
-		case <-session.stopCh:
+		case <-ctx.Done():
 			return
 		default:
 		}
@@ -268,33 +302,96 @@ func (nl *NiuLai) screamLoop(session *screamSession) {
 			return
 		}
 
-		if session.chatID != "" {
-			if err := nl.client.SendMarkdown(session.chatID, session.chatType, screamContent); err != nil {
-				nl.logger.Warn("failed to send scream message", "err", err)
-			} else {
-				nl.logger.Info("scream sent", "content", screamContent)
-			}
+		// 在真正发送前再检查一次停止信号，尽量减少停止后仍多发一轮的窗口
+		select {
+		case <-nl.ctx.Done():
+			return
+		case <-ctx.Done():
+			return
+		default:
 		}
+
+		nl.sendScreamToTargets(ctx)
 
 		interval := nl.cfg.RandomInterval()
 		nl.logger.Debug("next scream interval", "interval", interval)
 
-		select {
-		case <-nl.ctx.Done():
+		if !nl.sleep(ctx, interval) {
 			return
-		case <-session.stopCh:
-			return
-		case <-time.After(interval):
-			// 继续下一轮
 		}
 	}
 }
 
-func (nl *NiuLai) signalScreamStop() {
-	nl.screamMu.Lock()
-	defer nl.screamMu.Unlock()
-	if nl.screamStop != nil {
-		close(nl.screamStop)
-		nl.screamStop = nil
+// sendScreamToTargets 向所有目标群聊发送“妈妈”，并清理连续失败过多的群聊
+func (nl *NiuLai) sendScreamToTargets(ctx context.Context) {
+	chatIDs := nl.targetChatIDs()
+	if len(chatIDs) == 0 {
+		nl.logger.Warn("no target chats available, screaming will not send messages")
+		return
 	}
+
+	for _, chatID := range chatIDs {
+		select {
+		case <-nl.ctx.Done():
+			return
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if err := nl.client.SendMarkdown(chatID, wecom.ChatTypeGroup, screamContent); err != nil {
+			failures := nl.recordSendFailure(chatID)
+			nl.logger.Warn("failed to send scream message",
+				"chatid", chatID,
+				"err", err,
+				"failures", failures,
+				"max_failures", nl.cfg.MaxSendFailures,
+			)
+		} else {
+			nl.resetSendFailures(chatID)
+			nl.logger.Info("scream sent", "chatid", chatID, "content", screamContent)
+		}
+	}
+}
+
+func (nl *NiuLai) recordSendFailure(chatID string) int {
+	nl.failuresMu.Lock()
+	nl.failures[chatID]++
+	failures := nl.failures[chatID]
+	nl.failuresMu.Unlock()
+
+	if failures >= nl.cfg.MaxSendFailures {
+		nl.chatsMu.Lock()
+		if _, ok := nl.chats[chatID]; ok {
+			delete(nl.chats, chatID)
+			nl.failuresMu.Lock()
+			delete(nl.failures, chatID)
+			nl.failuresMu.Unlock()
+			nl.logger.Info("removed chat due to consecutive send failures",
+				"chatid", chatID,
+				"failures", failures,
+				"max_failures", nl.cfg.MaxSendFailures,
+			)
+		}
+		nl.chatsMu.Unlock()
+	}
+
+	return failures
+}
+
+func (nl *NiuLai) resetSendFailures(chatID string) {
+	nl.failuresMu.Lock()
+	defer nl.failuresMu.Unlock()
+	delete(nl.failures, chatID)
+}
+
+func (nl *NiuLai) getSendFailures(chatID string) int {
+	nl.failuresMu.Lock()
+	defer nl.failuresMu.Unlock()
+	return nl.failures[chatID]
+}
+
+// isSpaceLike 判断 r 是否为空格类字符，包括 Unicode 空白和零宽空格。
+func isSpaceLike(r rune) bool {
+	return unicode.IsSpace(r) || r == zeroWidthSpace
 }

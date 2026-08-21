@@ -21,6 +21,7 @@ type Config struct {
 	MinIntervalSeconds int
 	MaxIntervalSeconds int
 	CooldownMinutes    int
+	MaxSendFailures    int
 
 	TargetChatID string
 	LogLevel     string
@@ -75,6 +76,14 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("COOLDOWN_MINUTES must be positive")
 	}
 
+	maxSendFailures, err := parseInt(os.Getenv("MAX_SEND_FAILURES"), 3)
+	if err != nil {
+		return nil, fmt.Errorf("invalid MAX_SEND_FAILURES: %w", err)
+	}
+	if maxSendFailures <= 0 {
+		return nil, fmt.Errorf("MAX_SEND_FAILURES must be positive")
+	}
+
 	logLevel := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL")))
 	if logLevel == "" {
 		logLevel = "info"
@@ -89,6 +98,7 @@ func Load() (*Config, error) {
 		MinIntervalSeconds: minInterval,
 		MaxIntervalSeconds: maxInterval,
 		CooldownMinutes:    cooldown,
+		MaxSendFailures:    maxSendFailures,
 		TargetChatID:       strings.TrimSpace(os.Getenv("TARGET_CHAT_ID")),
 		LogLevel:           logLevel,
 	}, nil
