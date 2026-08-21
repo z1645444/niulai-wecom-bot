@@ -1,0 +1,21 @@
+# 二进制产物
+niulai
+niulai-wecom-bot
+
+# Go
+*.exe
+*.test
+*.out
+vendor/
+
+# 环境变量
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
