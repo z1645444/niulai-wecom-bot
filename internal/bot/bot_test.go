@@ -86,23 +86,23 @@ func TestIsStopCommand(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "mention another user",
+			name: "mention another user still stops on keyword",
 			body: &wecom.MsgCallbackBody{
 				MsgType: "text",
 				AIBotID: "bot-1",
 				Text:    wecom.TextBody{Content: "牛来"},
 				Mention: []wecom.Mention{{UserID: "user-2", Type: 1}},
 			},
-			want: false,
+			want: true,
 		},
 		{
-			name: "no mention",
+			name: "no mention still stops on keyword",
 			body: &wecom.MsgCallbackBody{
 				MsgType: "text",
 				AIBotID: "bot-1",
 				Text:    wecom.TextBody{Content: "牛来"},
 			},
-			want: false,
+			want: true,
 		},
 		{
 			name: "non-text message",
@@ -114,11 +114,10 @@ func TestIsStopCommand(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "fallback when no aibotid",
+			name: "keyword without bot id",
 			body: &wecom.MsgCallbackBody{
 				MsgType: "text",
 				Text:    wecom.TextBody{Content: "牛来"},
-				Mention: []wecom.Mention{{UserID: "bot-1", Type: 1}},
 			},
 			want: true,
 		},
@@ -233,6 +232,25 @@ func TestStopCommandStartsCooldownWithoutReply(t *testing.T) {
 		t.Fatalf("expected no respond, got %+v", fake.responds)
 	}
 	fake.mu.Unlock()
+}
+
+func TestStopCommandStartsCooldownOnKeywordWithoutMention(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	nl := New(&config.Config{CooldownMinutes: 1}, nil, logger)
+
+	if !nl.machine.StartScreaming() {
+		t.Fatal("failed to start screaming")
+	}
+
+	nl.OnMessage("req-1", &wecom.MsgCallbackBody{
+		MsgType: "text",
+		ChatID:  "chat-1",
+		Text:    wecom.TextBody{Content: "牛来"},
+	})
+
+	if nl.machine.Current() != state.COOLDOWN {
+		t.Fatalf("state = %v, want %v", nl.machine.Current(), state.COOLDOWN)
+	}
 }
 
 func TestScreamLoopSendsToMultipleChats(t *testing.T) {

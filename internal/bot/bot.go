@@ -131,7 +131,8 @@ func (nl *NiuLai) SetClient(client Sender) {
 	nl.client = client
 }
 
-// OnMessage 实现 wecom.Handler，处理收到的用户消息
+// OnMessage 实现 wecom.Handler，处理收到的用户消息。
+// 文本中包含“牛来”即触发停止，不依赖企业微信回调中的 @ 字段。
 func (nl *NiuLai) OnMessage(reqID string, body *wecom.MsgCallbackBody) {
 	if body == nil {
 		return
@@ -153,8 +154,8 @@ func (nl *NiuLai) OnMessage(reqID string, body *wecom.MsgCallbackBody) {
 	// 自动发现目标群：从任何群消息或群事件回调中收集 chatid
 	nl.captureChatID(body.ChatType, body.ChatID)
 
-	// 去重、幂等可由调用方自行维护 msgid 集合
-	// 这里只关注停止指令
+	// 去重、幂等可由调用方自行维护 msgid 集合。
+	// 这里只关注停止指令。
 	if !nl.isStopCommand(body) {
 		return
 	}
@@ -229,25 +230,9 @@ func (nl *NiuLai) isStopCommand(body *wecom.MsgCallbackBody) bool {
 		return false
 	}
 
-	// 要求消息中 @ 了当前机器人
-	// 企业微信智能机器人回调里 mention 字段会包含被 @ 的用户/机器人 ID
-	// 如果回调携带了 aibotid，则精确匹配；否则只要存在任何 @ 即认为命中
-	if len(body.Mention) == 0 {
-		return false
-	}
-	for _, m := range body.Mention {
-		if body.AIBotID != "" {
-			if m.UserID == body.AIBotID {
-				return true
-			}
-			continue
-		}
-		// 无机器人 ID 时退化到原来的启发式判断
-		if m.Type == 1 || m.UserID != "" {
-			return true
-		}
-	}
-	return false
+	// 收到包含“牛来”的文本后立即停止。企业微信不同版本的回调
+	// 对 @ 信息字段格式并不一致，因此停止指令不再依赖 mention 字段。
+	return true
 }
 
 func (nl *NiuLai) onTrigger() {
