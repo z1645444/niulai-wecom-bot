@@ -16,6 +16,33 @@ func TestLoadRequired(t *testing.T) {
 	}
 }
 
+func TestLoadTargetChatID(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+	t.Setenv("TARGET_CHAT_ID", "target-chat, target-chat-2,target-chat")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.TargetChatID != "target-chat,target-chat-2" {
+		t.Fatalf("TargetChatID = %q, want %q", cfg.TargetChatID, "target-chat,target-chat-2")
+	}
+}
+
+func TestParseTargetChatIDs(t *testing.T) {
+	got := ParseTargetChatIDs(" chat-1,chat-2,,chat-1, chat-3 ")
+	want := []string{"chat-1", "chat-2", "chat-3"}
+	if len(got) != len(want) {
+		t.Fatalf("ParseTargetChatIDs() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ParseTargetChatIDs()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestIsWorkTime(t *testing.T) {
 	cfg := &Config{
 		WorkStartTime: mustParse("09:00"),

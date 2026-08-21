@@ -38,8 +38,9 @@
 
 ## 5. 目标群聊发现规则
 
-- 当未配置 `TARGET_CHAT_ID` 时，机器人从收到的 `aibot_msg_callback` 或 `aibot_event_callback` 中自动收集 `chattype=group` 的 `chatid`
-- 收集到的 `chatid` 保存在内存中，服务重启后清空
+- 机器人从收到的 `aibot_msg_callback` 或 `aibot_event_callback` 中自动收集 `chattype=group` 的 `chatid`
+- 自动收集到的 `chatid` 会增量合并到 `TARGET_CHAT_ID`，已有 ID 不重复添加
+- 收集到的 `chatid` 保存在当前运行配置中，服务重启后需重新加载环境变量或再次发现
 - 企业微信智能机器人目前**不支持**进群/退群事件回调，因此无法主动感知“机器人在哪些群”，只能被动发现产生过交互的群
 - 被连续发送失败 `MAX_SEND_FAILURES` 次的群聊会自动从列表中移除
 
@@ -88,7 +89,7 @@
 | `MAX_INTERVAL_SECONDS` | 否 | `30` | 发送间隔上限 |
 | `COOLDOWN_MINUTES` | 否 | `120` | 冷却时长（分钟） |
 | `MAX_SEND_FAILURES` | 否 | `3` | 连续发送失败多少次后移除目标群聊 |
-| `TARGET_CHAT_ID` | 否 | - | 主动发送目标会话 ID，留空则自动收集群聊 |
+| `TARGET_CHAT_ID` | 否 | - | 主动发送目标会话 ID，多个 ID 用逗号分隔；运行期间自动发现的新群聊会增量加入并去重 |
 | `LOG_LEVEL` | 否 | `info` | 日志级别：debug、info、warn、error |
 
 ## 9. WebSocket 协议要点

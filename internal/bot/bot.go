@@ -35,8 +35,8 @@ type NiuLai struct {
 	scheduler *scheduler.Scheduler
 	logger    *slog.Logger
 
-	// chats 是运行时自动发现的活跃群聊集合
-	// 当没有配置 TARGET_CHAT_ID 时，从收到的群消息/事件回调中收集
+	// chats 是运行时自动发现的群聊集合；发现到的 ID 会增量合并到
+	// TARGET_CHAT_ID 配置中。
 	chatsMu sync.RWMutex
 	chats   map[string]struct{}
 
@@ -187,33 +187,30 @@ func (nl *NiuLai) captureChatID(chatType, chatID string) {
 	nl.chatsMu.Lock()
 	defer nl.chatsMu.Unlock()
 
+	configuredIDs := config.ParseTargetChatIDs(nl.cfg.TargetChatID)
+	for _, id := range configuredIDs {
+		if id == chatID {
+			nl.logger.Debug("target chatid already configured", "chatid", chatID)
+			return
+		}
+	}
 	if _, ok := nl.chats[chatID]; ok {
 		return
 	}
 
 	nl.chats[chatID] = struct{}{}
+	configuredIDs = append(configuredIDs, chatID)
+	nl.cfg.TargetChatID = config.FormatTargetChatIDs(configuredIDs)
 	nl.logger.Info("auto-captured target group chatid", "chatid", chatID)
 }
 
 // targetChatIDs 返回当前需要发送消息的群聊 ID 列表
-// 如果配置了 TARGET_CHAT_ID，则优先使用配置值；否则使用运行时收集的群聊列表
+// TARGET_CHAT_ID 支持逗号分隔的多个 ID；自动发现的 ID 会被增量加入该配置。
 func (nl *NiuLai) targetChatIDs() []string {
-	if nl.cfg.TargetChatID != "" {
-		return []string{nl.cfg.TargetChatID}
-	}
-
 	nl.chatsMu.RLock()
 	defer nl.chatsMu.RUnlock()
 
-	if len(nl.chats) == 0 {
-		return nil
-	}
-
-	ids := make([]string, 0, len(nl.chats))
-	for id := range nl.chats {
-		ids = append(ids, id)
-	}
-	return ids
+	return config.ParseTargetChatIDs(nl.cfg.TargetChatID)
 }
 
 func (nl *NiuLai) isStopCommand(body *wecom.MsgCallbackBody) bool {
@@ -347,8 +344,22 @@ func (nl *NiuLai) recordSendFailure(chatID string) int {
 
 	if failures >= nl.cfg.MaxSendFailures {
 		nl.chatsMu.Lock()
-		if _, ok := nl.chats[chatID]; ok {
-			delete(nl.chats, chatID)
+		_, discovered := nl.chats[chatID]
+		remaining := make([]string, 0)
+		removedFromTargets := false
+		for _, id := range config.ParseTargetChatIDs(nl.cfg.TargetChatID) {
+			if id == chatID {
+				removedFromTargets = true
+				continue
+			}
+			remaining = append(remaining, id)
+		}
+
+		if discovered || removedFromTargets {
+			if discovered {
+				delete(nl.chats, chatID)
+			}
+			nl.cfg.TargetChatID = config.FormatTargetChatIDs(remaining)
 			nl.failuresMu.Lock()
 			delete(nl.failures, chatID)
 			nl.failuresMu.Unlock()

@@ -27,6 +27,31 @@ type Config struct {
 	LogLevel     string
 }
 
+// ParseTargetChatIDs parses the comma-separated TARGET_CHAT_ID value and
+// returns trimmed, de-duplicated chat IDs in their original order.
+func ParseTargetChatIDs(value string) []string {
+	parts := strings.Split(value, ",")
+	ids := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// FormatTargetChatIDs formats chat IDs for TARGET_CHAT_ID.
+func FormatTargetChatIDs(ids []string) string {
+	return strings.Join(ParseTargetChatIDs(strings.Join(ids, ",")), ",")
+}
+
 // Load 从环境变量加载配置，返回解析后的 Config 或错误
 func Load() (*Config, error) {
 	botID := strings.TrimSpace(os.Getenv("WECOM_BOT_ID"))
@@ -89,6 +114,8 @@ func Load() (*Config, error) {
 		logLevel = "info"
 	}
 
+	targetChatID := FormatTargetChatIDs([]string{os.Getenv("TARGET_CHAT_ID")})
+
 	return &Config{
 		WeComBotID:         botID,
 		WeComBotSecret:     botSecret,
@@ -99,7 +126,7 @@ func Load() (*Config, error) {
 		MaxIntervalSeconds: maxInterval,
 		CooldownMinutes:    cooldown,
 		MaxSendFailures:    maxSendFailures,
-		TargetChatID:       strings.TrimSpace(os.Getenv("TARGET_CHAT_ID")),
+		TargetChatID:       targetChatID,
 		LogLevel:           logLevel,
 	}, nil
 }

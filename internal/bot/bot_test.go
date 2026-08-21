@@ -183,14 +183,20 @@ func TestCaptureMultipleChatIDs(t *testing.T) {
 	}
 }
 
-func TestTargetChatIDPrefersConfig(t *testing.T) {
+func TestTargetChatIDsMergeConfiguredAndDiscovered(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	cfg := &config.Config{
 		CooldownMinutes: 1,
-		TargetChatID:    "target-chat",
+		TargetChatID:    "target-chat,target-chat-2",
 	}
 	nl := New(cfg, nil, logger)
 
+	nl.OnMessage("", &wecom.MsgCallbackBody{
+		ChatType: "group",
+		ChatID:   "target-chat-2",
+		MsgType:  "text",
+		Text:     wecom.TextBody{Content: "hello"},
+	})
 	nl.OnMessage("", &wecom.MsgCallbackBody{
 		ChatType: "group",
 		ChatID:   "chat-1",
@@ -199,8 +205,43 @@ func TestTargetChatIDPrefersConfig(t *testing.T) {
 	})
 
 	got := nl.targetChatIDs()
+	want := []string{"target-chat", "target-chat-2", "chat-1"}
+	if len(got) != len(want) {
+		t.Fatalf("targetChatIDs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("targetChatIDs[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if cfg.TargetChatID != "target-chat,target-chat-2,chat-1" {
+		t.Fatalf("TargetChatID = %q, want %q", cfg.TargetChatID, "target-chat,target-chat-2,chat-1")
+	}
+}
+
+func TestConfiguredTargetIsUsedBeforeDiscovery(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	nl := New(&config.Config{
+		CooldownMinutes: 1,
+		TargetChatID:    "target-chat",
+	}, nil, logger)
+
+	// 即使没有收到任何群消息回调，固定目标也必须可直接使用。
+	got := nl.targetChatIDs()
 	if len(got) != 1 || got[0] != "target-chat" {
 		t.Fatalf("targetChatIDs = %v, want [target-chat]", got)
+	}
+
+	// 收到同一个群的回调时，不应重复追加该 ID。
+	nl.OnMessage("", &wecom.MsgCallbackBody{
+		ChatType: "group",
+		ChatID:   "target-chat",
+		MsgType:  "text",
+		Text:     wecom.TextBody{Content: "hello"},
+	})
+	got = nl.targetChatIDs()
+	if len(got) != 1 || got[0] != "target-chat" {
+		t.Fatalf("targetChatIDs after duplicate discovery = %v, want [target-chat]", got)
 	}
 }
 
@@ -399,6 +440,9 @@ func TestFailureEviction(t *testing.T) {
 	if ok {
 		t.Fatal("expected chat-1 to be evicted after failures")
 	}
+	if got := nl.targetChatIDs(); len(got) != 0 {
+		t.Fatalf("targetChatIDs after eviction = %v, want []", got)
+	}
 
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
@@ -426,17 +470,15 @@ func TestConfiguredTargetTracksFailures(t *testing.T) {
 	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3, TargetChatID: "target-chat"}, fake, logger)
 	nl.SetClient(fake)
 
-	nl.sendScreamToTargets(context.Background())
-	if nl.getSendFailures("target-chat") != 1 {
-		t.Fatalf("expected configured target failures = 1, got %d", nl.getSendFailures("target-chat"))
+	for i := 0; i < 3; i++ {
+		nl.sendScreamToTargets(context.Background())
 	}
 
-	// 配置的目标不会被驱逐
-	nl.chatsMu.RLock()
-	_, ok := nl.chats["target-chat"]
-	nl.chatsMu.RUnlock()
-	if ok {
-		t.Fatal("configured target should not be in auto-discovered chats")
+	if got := nl.targetChatIDs(); len(got) != 0 {
+		t.Fatalf("targetChatIDs after eviction = %v, want []", got)
+	}
+	if got := nl.getSendFailures("target-chat"); got != 0 {
+		t.Fatalf("configured target failures after eviction = %d, want 0", got)
 	}
 }
 

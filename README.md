@@ -23,8 +23,10 @@ cp .env.example .env
 ```bash
 WECOM_BOT_ID=your-bot-id
 WECOM_BOT_SECRET=your-bot-secret
-TARGET_CHAT_ID=your-target-chat-id
+TARGET_CHAT_ID=your-target-chat-id-1,your-target-chat-id-2
 ```
+
+`TARGET_CHAT_ID` 支持使用逗号分隔配置多个会话。运行期间自动发现的新群聊会增量加入目标列表，已存在的 ID 不会重复添加；修改启动配置后请重启进程。
 
 ### 3. 运行
 
@@ -75,4 +77,4 @@ make build-all
 
 - `WECOM_BOT_ID` 和 `WECOM_BOT_SECRET` 请通过环境变量注入，不要提交到代码仓库
 - 服务以单进程方式运行，重启后状态重置为 `IDLE`
-- 主动发送消息需要指定 `TARGET_CHAT_ID`，可在企业微信后台或回调中获取
+- `TARGET_CHAT_ID` 支持逗号分隔的多个会话 ID；留空时从回调中自动发现并增量加入
