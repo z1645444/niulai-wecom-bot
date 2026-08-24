@@ -215,6 +215,93 @@ func TestIsStopCommand(t *testing.T) {
 			},
 			want: true,
 		},
+		{
+			name: "leading mention with negation does not stop",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				AIBotID: "bot-1",
+				Text:    wecom.TextBody{Content: "@牛来 不要停"},
+				Mention: []wecom.Mention{{UserID: "bot-1", Type: 1}},
+			},
+			want: false,
+		},
+		{
+			name: "leading mention only does not stop",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				AIBotID: "bot-1",
+				Text:    wecom.TextBody{Content: "@牛来"},
+				Mention: []wecom.Mention{{UserID: "bot-1", Type: 1}},
+			},
+			want: false,
+		},
+		{
+			name: "keyword after leading mention stops",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				AIBotID: "bot-1",
+				Text:    wecom.TextBody{Content: "@牛来 牛来"},
+				Mention: []wecom.Mention{{UserID: "bot-1", Type: 1}},
+			},
+			want: true,
+		},
+		{
+			name: "keyword not after mention still stops",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				AIBotID: "bot-1",
+				Text:    wecom.TextBody{Content: "快停下 牛来"},
+			},
+			want: true,
+		},
+		{
+			name: "renamed bot mention with negation does not stop",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				Text:    wecom.TextBody{Content: "@新名字 不要停"},
+			},
+			want: false,
+		},
+		{
+			name: "consecutive leading mentions are stripped",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				Text:    wecom.TextBody{Content: "@张三 @牛来 不要停"},
+			},
+			want: false,
+		},
+		{
+			name: "mention without separator does not stop",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				Text:    wecom.TextBody{Content: "@牛来不要停"},
+			},
+			want: false,
+		},
+		{
+			name: "mention with separator but no content does not stop",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				Text:    wecom.TextBody{Content: "@牛来 "},
+			},
+			want: false,
+		},
+		{
+			name: "other user mention then keyword stops",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				Text:    wecom.TextBody{Content: "@张三 牛来"},
+			},
+			want: true,
+		},
+		{
+			name: "mention in middle is not stripped",
+			body: &wecom.MsgCallbackBody{
+				MsgType: "text",
+				Text:    wecom.TextBody{Content: "牛来@牛来 不要停"},
+			},
+			want: true,
+		},
 	}
 
 	for _, c := range cases {
@@ -222,6 +309,35 @@ func TestIsStopCommand(t *testing.T) {
 			got := nl.isStopCommand(c.body)
 			if got != c.want {
 				t.Fatalf("isStopCommand() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestIsStopCommandWithCustomKeyword(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	nl := New(&config.Config{CooldownMinutes: 1, StopKeyword: "牛哥"}, nil, logger)
+
+	cases := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"custom keyword stops", "牛哥", true},
+		{"custom keyword after mention stops", "@牛哥 牛哥", true},
+		{"custom keyword mention only does not stop", "@牛哥", false},
+		{"default keyword does not stop", "牛来", false},
+		{"default-name mention stripped generically", "@牛来 不要停", false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := &wecom.MsgCallbackBody{
+				MsgType: "text",
+				Text:    wecom.TextBody{Content: c.content},
+			}
+			if got := nl.isStopCommand(body); got != c.want {
+				t.Fatalf("isStopCommand(%q) = %v, want %v", c.content, got, c.want)
 			}
 		})
 	}
@@ -770,7 +886,7 @@ func TestScreamLoopSendsToMultipleChats(t *testing.T) {
 	seen := make(map[string]struct{})
 	for _, c := range fake.sends {
 		seen[c.chatID] = struct{}{}
-		if c.content != screamContent {
+		if c.content != config.DefaultScreamContent {
 			t.Fatalf("unexpected content: %q", c.content)
 		}
 	}
@@ -819,7 +935,7 @@ func TestScreamLoopUsesTargetChatID(t *testing.T) {
 		if c.chatType != wecom.ChatTypeGroup {
 			t.Fatalf("unexpected chatType: %d", c.chatType)
 		}
-		if c.content != screamContent {
+		if c.content != config.DefaultScreamContent {
 			t.Fatalf("unexpected content: %q", c.content)
 		}
 	}

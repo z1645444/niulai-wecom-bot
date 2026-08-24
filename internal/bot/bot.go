@@ -24,11 +24,7 @@ import (
 // imageHTTPClient 限定图片拉取的超时，避免远程地址不可用时拖住消息处理
 var imageHTTPClient = &http.Client{Timeout: 15 * time.Second}
 
-const (
-	screamContent  = "妈妈"
-	triggerKeyword = "牛来"
-	zeroWidthSpace = '\u200B'
-)
+const zeroWidthSpace = '\u200B'
 
 // Sender 是 bot 对外发送消息所需的最小接口，便于测试与解耦
 type Sender interface {
@@ -83,6 +79,13 @@ type NiuLai struct {
 
 // New 创建一个新的牛来实例
 func New(cfg *config.Config, client Sender, logger *slog.Logger) *NiuLai {
+	// 空值回退默认，保证绕过 config.Load 的调用方（如测试）行为确定
+	if cfg.StopKeyword == "" {
+		cfg.StopKeyword = config.DefaultStopKeyword
+	}
+	if cfg.ScreamContent == "" {
+		cfg.ScreamContent = config.DefaultScreamContent
+	}
 	machine := state.NewMachine()
 	nl := &NiuLai{
 		cfg:        cfg,
@@ -159,7 +162,8 @@ func (nl *NiuLai) SetClient(client Sender) {
 }
 
 // OnMessage 实现 wecom.Handler，处理收到的用户消息。
-// 文本中包含“牛来”即触发停止，不依赖企业微信回调中的 @ 字段。
+// 文本剥离开头的 @提及 后仍包含停止关键词（默认“牛来”）即触发停止，
+// 不依赖企业微信回调中的 @ 字段。
 func (nl *NiuLai) OnMessage(reqID string, body *wecom.MsgCallbackBody) {
 	if body == nil {
 		return
@@ -361,19 +365,38 @@ func (nl *NiuLai) isStopCommand(body *wecom.MsgCallbackBody) bool {
 	if body.MsgType != "text" {
 		return false
 	}
-	// 去除所有 Unicode 空白字符（包括普通空格、Tab、全角空格、
+
+	// 1. 泛化提及剥离（作用于原文）：客户端插入的提及以 @ 开始、以空白类字符
+	// 结束并分隔后续内容，循环剥离开头连续的提及段；无分隔符的“@xxx”无法
+	// 确定名字边界，交给第 3 步的已知前缀兜底
+	content := stripLeadingMentions(body.Text.Content)
+	// 2. 去除所有 Unicode 空白字符（包括普通空格、Tab、全角空格、
 	// 不间断空格、零宽空格等），避免用户输入时夹杂特殊空白导致无法识别。
-	content := strings.Join(strings.FieldsFunc(body.Text.Content, isSpaceLike), "")
+	// 必须放在提及剥离之后，否则分隔符被抹掉、提及边界丢失
+	content = strings.Join(strings.FieldsFunc(content, isSpaceLike), "")
+	// 3. 已知关键词前缀兜底：处理“@牛来不要停”（无分隔符）和“@牛来”（纯提及）
+	content = strings.TrimPrefix(content, "@"+nl.cfg.StopKeyword)
 	if content == "" {
 		return false
 	}
-	if !strings.Contains(content, triggerKeyword) {
-		return false
-	}
 
-	// 收到包含“牛来”的文本后立即停止。企业微信不同版本的回调
-	// 对 @ 信息字段格式并不一致，因此停止指令不再依赖 mention 字段。
-	return true
+	// 4. 剩余内容包含关键词即停止。企业微信不同版本的回调
+	// 对 @ 信息字段格式并不一致，因此停止指令不依赖 mention 字段。
+	return strings.Contains(content, nl.cfg.StopKeyword)
+}
+
+// stripLeadingMentions 循环剥离文本开头连续的 @提及 段：
+// 提及以 @ 开始、以空白类字符（含零宽空格）为分隔符；遇到无分隔符的 @ 段即返回，
+// 由调用方用已知关键词前缀兜底
+func stripLeadingMentions(s string) string {
+	for strings.HasPrefix(s, "@") {
+		idx := strings.IndexFunc(s, isSpaceLike)
+		if idx < 0 {
+			return s
+		}
+		s = strings.TrimLeftFunc(s[idx:], isSpaceLike)
+	}
+	return s
 }
 
 func (nl *NiuLai) onTrigger() {
@@ -448,7 +471,7 @@ func (nl *NiuLai) screamLoop(ctx context.Context) {
 	}
 }
 
-// sendScreamToTargets 向所有目标群聊发送“妈妈”，并清理连续失败过多的群聊
+// sendScreamToTargets 向所有目标群聊发送喊话内容，并清理连续失败过多的群聊
 func (nl *NiuLai) sendScreamToTargets(ctx context.Context) {
 	chatIDs := nl.targetChatIDs()
 	if len(chatIDs) == 0 {
@@ -465,7 +488,7 @@ func (nl *NiuLai) sendScreamToTargets(ctx context.Context) {
 		default:
 		}
 
-		if err := nl.client.SendMarkdown(chatID, wecom.ChatTypeGroup, screamContent); err != nil {
+		if err := nl.client.SendMarkdown(chatID, wecom.ChatTypeGroup, nl.cfg.ScreamContent); err != nil {
 			failures := nl.recordSendFailure(chatID)
 			nl.logger.Warn("failed to send scream message",
 				"chatid", chatID,
@@ -476,7 +499,7 @@ func (nl *NiuLai) sendScreamToTargets(ctx context.Context) {
 		} else {
 			nl.resetSendFailures(chatID)
 			nl.markTriggered(chatID)
-			nl.logger.Info("scream sent", "chatid", chatID, "content", screamContent)
+			nl.logger.Info("scream sent", "chatid", chatID, "content", nl.cfg.ScreamContent)
 		}
 	}
 }

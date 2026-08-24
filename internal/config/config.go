@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // 完成后回复类型
@@ -19,6 +20,15 @@ const (
 
 // DefaultFinishReplyText 是完成后回复的默认文本
 const DefaultFinishReplyText = "🐮"
+
+// DefaultStopKeyword 是停止指令的默认关键词
+const DefaultStopKeyword = "牛来"
+
+// DefaultScreamContent 是触发后喊话的默认内容
+const DefaultScreamContent = "妈妈"
+
+// zeroWidthSpace 与消息处理侧的规则一致：零宽空格按空白处理
+const zeroWidthSpace = '\u200B'
 
 // Config 保存应用运行时配置
 type Config struct {
@@ -33,6 +43,11 @@ type Config struct {
 	MaxIntervalSeconds int
 	CooldownMinutes    int
 	MaxSendFailures    int
+
+	// ScreamContent 是触发后向目标群聊发送的喊话内容，默认“妈妈”
+	ScreamContent string
+	// StopKeyword 是停止指令关键词：文本剥离开头的 @提及 后包含该词即停止，默认“牛来”
+	StopKeyword string
 
 	// ForceTriggerWindowMinutes 是每日保底触发窗口：工作结束前该时长内
 	// 若仍有群聊当天未触发，则强制触发一次
@@ -72,6 +87,14 @@ func ParseTargetChatIDs(value string) []string {
 // FormatTargetChatIDs formats chat IDs for TARGET_CHAT_ID.
 func FormatTargetChatIDs(ids []string) string {
 	return strings.Join(ParseTargetChatIDs(strings.Join(ids, ",")), ",")
+}
+
+// normalizeSpaces 压缩字符串中的所有 Unicode 空白字符（含零宽空格），
+// 与消息内容的空白压缩规则保持一致
+func normalizeSpaces(s string) string {
+	return strings.Join(strings.FieldsFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || r == zeroWidthSpace
+	}), "")
 }
 
 // Load 从环境变量加载配置，返回解析后的 Config 或错误
@@ -136,6 +159,18 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid FORCE_TRIGGER_WINDOW_MINUTES: %w", err)
 	}
 
+	// 停止关键词按与消息内容相同的规则压缩空白，
+	// 避免关键词本身含空白时永远无法命中压缩后的内容
+	stopKeyword := normalizeSpaces(os.Getenv("STOP_KEYWORD"))
+	if stopKeyword == "" {
+		stopKeyword = DefaultStopKeyword
+	}
+
+	screamContent := strings.TrimSpace(os.Getenv("SCREAM_CONTENT"))
+	if screamContent == "" {
+		screamContent = DefaultScreamContent
+	}
+
 	replyType := strings.ToLower(strings.TrimSpace(os.Getenv("FINISH_REPLY_TYPE")))
 	if replyType == "" {
 		replyType = ReplyTypeText
@@ -171,6 +206,8 @@ func Load() (*Config, error) {
 		MaxIntervalSeconds:        maxInterval,
 		CooldownMinutes:           cooldown,
 		MaxSendFailures:           maxSendFailures,
+		ScreamContent:             screamContent,
+		StopKeyword:               stopKeyword,
 		ForceTriggerWindowMinutes: forceWindow,
 		FinishReplyType:           replyType,
 		FinishReplyText:           replyText,

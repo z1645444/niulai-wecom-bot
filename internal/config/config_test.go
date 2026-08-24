@@ -166,6 +166,68 @@ func TestLoadForceTriggerWindowInvalid(t *testing.T) {
 	}
 }
 
+func TestLoadStopKeywordAndScreamContentDefaults(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.StopKeyword != DefaultStopKeyword {
+		t.Fatalf("StopKeyword = %q, want %q", cfg.StopKeyword, DefaultStopKeyword)
+	}
+	if cfg.ScreamContent != DefaultScreamContent {
+		t.Fatalf("ScreamContent = %q, want %q", cfg.ScreamContent, DefaultScreamContent)
+	}
+}
+
+func TestLoadStopKeywordAndScreamContentCustom(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+	t.Setenv("STOP_KEYWORD", "牛哥")
+	t.Setenv("SCREAM_CONTENT", "  干活了  ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.StopKeyword != "牛哥" {
+		t.Fatalf("StopKeyword = %q, want %q", cfg.StopKeyword, "牛哥")
+	}
+	if cfg.ScreamContent != "干活了" {
+		t.Fatalf("ScreamContent = %q, want %q", cfg.ScreamContent, "干活了")
+	}
+}
+
+func TestLoadStopKeywordNormalized(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+	t.Setenv("STOP_KEYWORD", " 牛​来 ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.StopKeyword != "牛来" {
+		t.Fatalf("StopKeyword = %q, want %q", cfg.StopKeyword, "牛来")
+	}
+}
+
+func TestLoadStopKeywordBlank(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+	t.Setenv("STOP_KEYWORD", "   ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.StopKeyword != DefaultStopKeyword {
+		t.Fatalf("StopKeyword = %q, want default %q", cfg.StopKeyword, DefaultStopKeyword)
+	}
+}
+
 func mustParse(s string) time.Time {
 	t, _ := time.Parse("15:04", s)
 	return t
