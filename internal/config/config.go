@@ -9,6 +9,17 @@ import (
 	"time"
 )
 
+// 完成后回复类型
+const (
+	// ReplyTypeText 回复纯文本
+	ReplyTypeText = "text"
+	// ReplyTypeImage 回复图片
+	ReplyTypeImage = "image"
+)
+
+// DefaultFinishReplyText 是完成后回复的默认文本
+const DefaultFinishReplyText = "🐮"
+
 // Config 保存应用运行时配置
 type Config struct {
 	WeComBotID     string
@@ -22,6 +33,17 @@ type Config struct {
 	MaxIntervalSeconds int
 	CooldownMinutes    int
 	MaxSendFailures    int
+
+	// ForceTriggerWindowMinutes 是每日保底触发窗口：工作结束前该时长内
+	// 若仍有群聊当天未触发，则强制触发一次
+	ForceTriggerWindowMinutes int
+
+	// FinishReplyType 是停止指令生效后的回复类型：text 或 image
+	FinishReplyType string
+	// FinishReplyText 是文本回复内容，默认 🐮
+	FinishReplyText string
+	// FinishReplyImageURL 是图片回复的地址索引，支持 http(s) URL 或本地文件路径
+	FinishReplyImageURL string
 
 	TargetChatID string
 	LogLevel     string
@@ -109,6 +131,29 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("MAX_SEND_FAILURES must be positive")
 	}
 
+	forceWindow, err := parseInt(os.Getenv("FORCE_TRIGGER_WINDOW_MINUTES"), 30)
+	if err != nil {
+		return nil, fmt.Errorf("invalid FORCE_TRIGGER_WINDOW_MINUTES: %w", err)
+	}
+
+	replyType := strings.ToLower(strings.TrimSpace(os.Getenv("FINISH_REPLY_TYPE")))
+	if replyType == "" {
+		replyType = ReplyTypeText
+	}
+	if replyType != ReplyTypeText && replyType != ReplyTypeImage {
+		return nil, fmt.Errorf("invalid FINISH_REPLY_TYPE %q: must be %q or %q", replyType, ReplyTypeText, ReplyTypeImage)
+	}
+
+	replyText := os.Getenv("FINISH_REPLY_TEXT")
+	if strings.TrimSpace(replyText) == "" {
+		replyText = DefaultFinishReplyText
+	}
+
+	replyImageURL := strings.TrimSpace(os.Getenv("FINISH_REPLY_IMAGE_URL"))
+	if replyType == ReplyTypeImage && replyImageURL == "" {
+		return nil, fmt.Errorf("FINISH_REPLY_IMAGE_URL is required when FINISH_REPLY_TYPE=%q", ReplyTypeImage)
+	}
+
 	logLevel := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL")))
 	if logLevel == "" {
 		logLevel = "info"
@@ -117,17 +162,21 @@ func Load() (*Config, error) {
 	targetChatID := FormatTargetChatIDs([]string{os.Getenv("TARGET_CHAT_ID")})
 
 	return &Config{
-		WeComBotID:         botID,
-		WeComBotSecret:     botSecret,
-		WorkStartTime:      startTime,
-		WorkEndTime:        endTime,
-		WorkDays:           workDays,
-		MinIntervalSeconds: minInterval,
-		MaxIntervalSeconds: maxInterval,
-		CooldownMinutes:    cooldown,
-		MaxSendFailures:    maxSendFailures,
-		TargetChatID:       targetChatID,
-		LogLevel:           logLevel,
+		WeComBotID:                botID,
+		WeComBotSecret:            botSecret,
+		WorkStartTime:             startTime,
+		WorkEndTime:               endTime,
+		WorkDays:                  workDays,
+		MinIntervalSeconds:        minInterval,
+		MaxIntervalSeconds:        maxInterval,
+		CooldownMinutes:           cooldown,
+		MaxSendFailures:           maxSendFailures,
+		ForceTriggerWindowMinutes: forceWindow,
+		FinishReplyType:           replyType,
+		FinishReplyText:           replyText,
+		FinishReplyImageURL:       replyImageURL,
+		TargetChatID:              targetChatID,
+		LogLevel:                  logLevel,
 	}, nil
 }
 

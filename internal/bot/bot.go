@@ -2,7 +2,13 @@ package bot
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +21,9 @@ import (
 	"niulai-wecom-bot/internal/wecom"
 )
 
+// imageHTTPClient 限定图片拉取的超时，避免远程地址不可用时拖住消息处理
+var imageHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
 const (
 	screamContent  = "妈妈"
 	triggerKeyword = "牛来"
@@ -25,6 +34,8 @@ const (
 type Sender interface {
 	SendMarkdown(chatID string, chatType uint32, content string) error
 	RespondMarkdown(reqID, content string) error
+	RespondImage(reqID, mediaID string) error
+	UploadMedia(ctx context.Context, mediaType, filename string, data []byte) (string, error)
 }
 
 // NiuLai 是虚拟员工“牛来”的业务编排器
@@ -44,6 +55,15 @@ type NiuLai struct {
 	failuresMu sync.Mutex
 	failures   map[string]int
 
+	// triggered 记录每个 chatid 最近一次触发成功的本地日期（yyyy-MM-dd），
+	// 用于“每个群聊每天至少触发一次”的保底判断
+	triggeredMu sync.Mutex
+	triggered   map[string]string
+
+	// mediaCache 缓存图片回复地址到 media_id 的映射，避免每次回复都重新上传素材
+	mediaMu    sync.Mutex
+	mediaCache map[string]string
+
 	// screamCtx/screamCancel 控制当前 SCREAMING 会话的生命周期
 	screamMu     sync.Mutex
 	screamCtx    context.Context
@@ -51,6 +71,9 @@ type NiuLai struct {
 
 	// sleep 控制 screamLoop 的等待行为，便于测试注入
 	sleep func(context.Context, time.Duration) bool
+
+	// now 便于测试注入时间
+	now func() time.Time
 
 	running atomic.Bool
 	ctx     context.Context
@@ -62,17 +85,21 @@ type NiuLai struct {
 func New(cfg *config.Config, client Sender, logger *slog.Logger) *NiuLai {
 	machine := state.NewMachine()
 	nl := &NiuLai{
-		cfg:      cfg,
-		machine:  machine,
-		client:   client,
-		logger:   logger,
-		chats:    make(map[string]struct{}),
-		failures: make(map[string]int),
-		sleep:    ctxSleep,
+		cfg:        cfg,
+		machine:    machine,
+		client:     client,
+		logger:     logger,
+		chats:      make(map[string]struct{}),
+		failures:   make(map[string]int),
+		triggered:  make(map[string]string),
+		mediaCache: make(map[string]string),
+		sleep:      ctxSleep,
+		now:        time.Now,
 	}
 	// 默认上下文，避免测试绕过 Start 时访问 nil ctx
 	nl.ctx = context.Background()
 	nl.scheduler = scheduler.New(cfg, machine, nl.onTrigger)
+	nl.scheduler.SetPendingToday(nl.hasPendingChatToday)
 	return nl
 }
 
@@ -169,6 +196,123 @@ func (nl *NiuLai) OnMessage(reqID string, body *wecom.MsgCallbackBody) {
 	nl.cancelScream()
 
 	nl.logger.Info("stop command accepted", "from", body.From.UserID, "chatid", body.ChatID)
+
+	// 必须异步回复：图片回复中的 UploadMedia 需要等待 WS 响应帧，
+	// 而响应帧只能由调用 OnMessage 的读循环读取；同步执行会堵死读循环直到超时
+	go nl.sendFinishReply(reqID)
+}
+
+// sendFinishReply 在停止指令生效后回复该消息，回复内容由配置决定；
+// 图片回复失败时回退为文本，保证完成信号可达
+func (nl *NiuLai) sendFinishReply(reqID string) {
+	if nl.client == nil {
+		return
+	}
+
+	if nl.cfg.FinishReplyType == config.ReplyTypeImage {
+		if err := nl.sendImageReply(reqID); err != nil {
+			nl.logger.Warn("image finish reply failed, fallback to text", "err", err)
+		} else {
+			return
+		}
+	}
+
+	if err := nl.client.RespondMarkdown(reqID, nl.finishReplyText()); err != nil {
+		nl.logger.Warn("failed to send finish reply", "err", err)
+	}
+}
+
+func (nl *NiuLai) finishReplyText() string {
+	if strings.TrimSpace(nl.cfg.FinishReplyText) == "" {
+		return config.DefaultFinishReplyText
+	}
+	return nl.cfg.FinishReplyText
+}
+
+// sendImageReply 上传图片素材并回复图片消息；失败时清除缓存以便下次重新上传
+func (nl *NiuLai) sendImageReply(reqID string) error {
+	mediaID, err := nl.finishImageMediaID()
+	if err != nil {
+		return err
+	}
+	if err := nl.client.RespondImage(reqID, mediaID); err != nil {
+		nl.mediaMu.Lock()
+		delete(nl.mediaCache, nl.cfg.FinishReplyImageURL)
+		nl.mediaMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// finishImageMediaID 返回图片回复的 media_id，进程内按地址缓存；
+// media_id 有效期 3 天，远长于进程运行周期内的回复间隔，重启后自动重新上传
+func (nl *NiuLai) finishImageMediaID() (string, error) {
+	addr := nl.cfg.FinishReplyImageURL
+	if addr == "" {
+		return "", fmt.Errorf("FINISH_REPLY_IMAGE_URL is empty")
+	}
+
+	nl.mediaMu.Lock()
+	mediaID, ok := nl.mediaCache[addr]
+	nl.mediaMu.Unlock()
+	if ok {
+		return mediaID, nil
+	}
+
+	data, filename, err := fetchImage(addr)
+	if err != nil {
+		return "", err
+	}
+
+	mediaID, err = nl.client.UploadMedia(nl.ctx, "image", filename, data)
+	if err != nil {
+		return "", fmt.Errorf("upload finish reply image: %w", err)
+	}
+
+	nl.mediaMu.Lock()
+	nl.mediaCache[addr] = mediaID
+	nl.mediaMu.Unlock()
+	nl.logger.Info("finish reply image uploaded", "addr", addr, "filename", filename)
+	return mediaID, nil
+}
+
+// fetchImage 按地址读取图片内容：http(s) URL 走网络请求，其余按本地文件路径处理
+func fetchImage(addr string) ([]byte, string, error) {
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		resp, err := imageHTTPClient.Get(addr)
+		if err != nil {
+			return nil, "", fmt.Errorf("fetch image %q: %w", addr, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, "", fmt.Errorf("fetch image %q: status %d", addr, resp.StatusCode)
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, wecom.MaxImageMediaSize+1))
+		if err != nil {
+			return nil, "", fmt.Errorf("read image %q: %w", addr, err)
+		}
+		if len(data) > wecom.MaxImageMediaSize {
+			return nil, "", fmt.Errorf("image %q exceeds %d bytes", addr, wecom.MaxImageMediaSize)
+		}
+		// 不信任服务端返回的 Content-Type 头，按内容嗅探，避免把错误页当图片上传
+		if ct := http.DetectContentType(data); !strings.HasPrefix(ct, "image/") {
+			return nil, "", fmt.Errorf("fetch image %q: unexpected content type %q", addr, ct)
+		}
+		filename := path.Base(resp.Request.URL.Path)
+		if filename == "." || filename == "/" || filename == "" {
+			filename = "image.png"
+		}
+		return data, filename, nil
+	}
+
+	data, err := os.ReadFile(addr)
+	if err != nil {
+		return nil, "", fmt.Errorf("read image file %q: %w", addr, err)
+	}
+	if len(data) > wecom.MaxImageMediaSize {
+		return nil, "", fmt.Errorf("image %q exceeds %d bytes", addr, wecom.MaxImageMediaSize)
+	}
+	return data, filepath.Base(addr), nil
 }
 
 // OnEvent 实现 wecom.Handler，从事件回调中发现群聊
@@ -331,9 +475,30 @@ func (nl *NiuLai) sendScreamToTargets(ctx context.Context) {
 			)
 		} else {
 			nl.resetSendFailures(chatID)
+			nl.markTriggered(chatID)
 			nl.logger.Info("scream sent", "chatid", chatID, "content", screamContent)
 		}
 	}
+}
+
+// markTriggered 记录该群聊今天已经成功触发过事件
+func (nl *NiuLai) markTriggered(chatID string) {
+	nl.triggeredMu.Lock()
+	defer nl.triggeredMu.Unlock()
+	nl.triggered[chatID] = nl.now().Format("2006-01-02")
+}
+
+// hasPendingChatToday 报告当前目标群聊中是否仍有今天未触发过的群
+func (nl *NiuLai) hasPendingChatToday() bool {
+	today := nl.now().Format("2006-01-02")
+	nl.triggeredMu.Lock()
+	defer nl.triggeredMu.Unlock()
+	for _, chatID := range nl.targetChatIDs() {
+		if nl.triggered[chatID] != today {
+			return true
+		}
+	}
+	return false
 }
 
 func (nl *NiuLai) recordSendFailure(chatID string) int {

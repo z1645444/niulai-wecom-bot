@@ -138,6 +138,104 @@ func TestSchedulerCanRestartAfterStop(t *testing.T) {
 	}
 }
 
+func TestSchedulerForceTriggerNearWorkEnd(t *testing.T) {
+	var triggered atomic.Bool
+	cfg := &config.Config{
+		WorkStartTime:             mustParseTime("09:00"),
+		WorkEndTime:               mustParseTime("18:00"),
+		WorkDays:                  map[int]struct{}{1: {}},
+		ForceTriggerWindowMinutes: 30,
+	}
+	machine := state.NewMachine()
+
+	s := New(cfg, machine, func() {
+		triggered.Store(true)
+	})
+	s.SetPendingToday(func() bool { return true })
+	// 周一 17:45，距工作结束 15 分钟，已进入保底窗口
+	s.now = func() time.Time {
+		return time.Date(2026, 8, 17, 17, 45, 0, 0, time.UTC)
+	}
+	s.randIntn = func(n int) int { return 99 } // 确保概率触发不命中
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.SetCheckInterval(50 * time.Millisecond)
+	go s.Start(ctx)
+
+	time.Sleep(120 * time.Millisecond)
+
+	if !triggered.Load() {
+		t.Fatal("expected force trigger inside the guarantee window")
+	}
+}
+
+func TestSchedulerNoForceTriggerWhenNothingPending(t *testing.T) {
+	var triggered atomic.Bool
+	cfg := &config.Config{
+		WorkStartTime:             mustParseTime("09:00"),
+		WorkEndTime:               mustParseTime("18:00"),
+		WorkDays:                  map[int]struct{}{1: {}},
+		ForceTriggerWindowMinutes: 30,
+	}
+	machine := state.NewMachine()
+
+	s := New(cfg, machine, func() {
+		triggered.Store(true)
+	})
+	s.SetPendingToday(func() bool { return false }) // 所有群聊今日已触发
+	s.now = func() time.Time {
+		return time.Date(2026, 8, 17, 17, 45, 0, 0, time.UTC)
+	}
+	s.randIntn = func(n int) int { return 99 }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.SetCheckInterval(50 * time.Millisecond)
+	go s.Start(ctx)
+
+	time.Sleep(120 * time.Millisecond)
+
+	if triggered.Load() {
+		t.Fatal("should not force trigger when every chat was triggered today")
+	}
+}
+
+func TestSchedulerNoForceTriggerOutsideWindow(t *testing.T) {
+	var triggered atomic.Bool
+	cfg := &config.Config{
+		WorkStartTime:             mustParseTime("09:00"),
+		WorkEndTime:               mustParseTime("18:00"),
+		WorkDays:                  map[int]struct{}{1: {}},
+		ForceTriggerWindowMinutes: 30,
+	}
+	machine := state.NewMachine()
+
+	s := New(cfg, machine, func() {
+		triggered.Store(true)
+	})
+	s.SetPendingToday(func() bool { return true })
+	// 周一 10:00，远早于保底窗口
+	s.now = func() time.Time {
+		return time.Date(2026, 8, 17, 10, 0, 0, 0, time.UTC)
+	}
+	s.randIntn = func(n int) int { return 99 }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.SetCheckInterval(50 * time.Millisecond)
+	go s.Start(ctx)
+
+	time.Sleep(120 * time.Millisecond)
+
+	if triggered.Load() {
+		t.Fatal("should not force trigger before the guarantee window")
+	}
+}
+
 func mustParseTime(s string) time.Time {
 	t, _ := time.Parse("15:04", s)
 	return t

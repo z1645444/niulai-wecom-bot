@@ -96,6 +96,76 @@ func TestParseInt(t *testing.T) {
 	}
 }
 
+func TestLoadFinishReplyDefaults(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.FinishReplyType != ReplyTypeText {
+		t.Fatalf("FinishReplyType = %q, want %q", cfg.FinishReplyType, ReplyTypeText)
+	}
+	if cfg.FinishReplyText != DefaultFinishReplyText {
+		t.Fatalf("FinishReplyText = %q, want default", cfg.FinishReplyText)
+	}
+	if cfg.FinishReplyImageURL != "" {
+		t.Fatalf("FinishReplyImageURL = %q, want empty", cfg.FinishReplyImageURL)
+	}
+	if cfg.ForceTriggerWindowMinutes != 30 {
+		t.Fatalf("ForceTriggerWindowMinutes = %d, want 30", cfg.ForceTriggerWindowMinutes)
+	}
+}
+
+func TestLoadFinishReplyImage(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+	t.Setenv("FINISH_REPLY_TYPE", "image")
+	t.Setenv("FINISH_REPLY_IMAGE_URL", "https://example.com/cow.png")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.FinishReplyType != ReplyTypeImage {
+		t.Fatalf("FinishReplyType = %q, want %q", cfg.FinishReplyType, ReplyTypeImage)
+	}
+	if cfg.FinishReplyImageURL != "https://example.com/cow.png" {
+		t.Fatalf("FinishReplyImageURL = %q", cfg.FinishReplyImageURL)
+	}
+}
+
+func TestLoadFinishReplyImageRequiresURL(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+	t.Setenv("FINISH_REPLY_TYPE", "image")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error when image reply has no URL")
+	}
+}
+
+func TestLoadFinishReplyTypeInvalid(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+	t.Setenv("FINISH_REPLY_TYPE", "video")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for invalid FINISH_REPLY_TYPE")
+	}
+}
+
+func TestLoadForceTriggerWindowInvalid(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+	t.Setenv("FORCE_TRIGGER_WINDOW_MINUTES", "0")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for zero FORCE_TRIGGER_WINDOW_MINUTES")
+	}
+}
+
 func mustParse(s string) time.Time {
 	t, _ := time.Parse("15:04", s)
 	return t

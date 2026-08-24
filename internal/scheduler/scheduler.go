@@ -18,6 +18,10 @@ type Scheduler struct {
 	onTrigger  func()
 	checkEvery time.Duration
 
+	// pendingToday 报告是否存在当天尚未触发的目标群聊，用于每日保底触发；
+	// 由业务方注入，未设置时保底逻辑不生效
+	pendingToday func() bool
+
 	// 可注入的依赖，便于测试
 	now      func() time.Time
 	randIntn func(int) int
@@ -105,9 +109,31 @@ func (s *Scheduler) tick() {
 	// 每 5 分钟检查一次，若工作 9 小时，则约 108 次检查
 	// 设置每次检查触发概率为 5%，期望每个工作日触发约 5 次
 	// 如需更低频，可调整此概率
-	if s.randIntn(100) < 5 {
+	if s.randIntn(100) < 5 || s.shouldForceTrigger(now) {
 		s.onTrigger()
 	}
+}
+
+// shouldForceTrigger 实现“每个群聊每天至少触发一次”的保底：
+// 进入工作结束前 FORCE_TRIGGER_WINDOW_MINUTES 分钟的窗口后，
+// 若仍有目标群聊当天未触发，则不再依赖概率，直接触发
+func (s *Scheduler) shouldForceTrigger(now time.Time) bool {
+	if s.pendingToday == nil || !s.pendingToday() {
+		return false
+	}
+	window := time.Duration(s.cfg.ForceTriggerWindowMinutes) * time.Minute
+	if window <= 0 {
+		return false
+	}
+	// 使用 now 的时区复原当天工作结束时刻，与 IsWorkTime 的本地时钟语义保持一致
+	end := time.Date(now.Year(), now.Month(), now.Day(),
+		s.cfg.WorkEndTime.Hour(), s.cfg.WorkEndTime.Minute(), 0, 0, now.Location())
+	return !now.Add(window).Before(end)
+}
+
+// SetPendingToday 注入“是否存在当天未触发的群聊”的判定函数
+func (s *Scheduler) SetPendingToday(fn func() bool) {
+	s.pendingToday = fn
 }
 
 // SetCheckInterval 用于测试时调整检查周期

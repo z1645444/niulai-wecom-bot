@@ -1,7 +1,9 @@
 package wecom
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -326,6 +328,425 @@ func TestClientSendMarkdown(t *testing.T) {
 	}
 	if body.ChatID != "chat-1" || body.MsgType != "markdown" || body.Markdown.Content != "妈妈" {
 		t.Fatalf("unexpected body: %+v", body)
+	}
+}
+
+func TestClientRespondImage(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	var (
+		received  []Frame
+		mu        sync.Mutex
+		connected = make(chan struct{})
+		once      sync.Once
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		var authReq Frame
+		if err := conn.ReadJSON(&authReq); err != nil {
+			return
+		}
+		if err := conn.WriteJSON(Frame{Cmd: "aibot_subscribe", ErrCode: 0}); err != nil {
+			return
+		}
+		once.Do(func() { close(connected) })
+
+		for {
+			var f Frame
+			if err := conn.ReadJSON(&f); err != nil {
+				return
+			}
+			mu.Lock()
+			received = append(received, f)
+			mu.Unlock()
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
+	client := NewClient("bot-id", "secret", nil, logger).SetURL(wsTestURL(t, server))
+
+	var runWG sync.WaitGroup
+	runWG.Add(1)
+	go func() {
+		defer runWG.Done()
+		_ = client.Run(ctx)
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		cancel()
+		runWG.Wait()
+		t.Fatal("client did not connect in time")
+	}
+
+	if err := client.RespondImage("req-callback", "media-1"); err != nil {
+		cancel()
+		runWG.Wait()
+		t.Fatalf("respond image: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	runWG.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	var respond *Frame
+	for i := range received {
+		if received[i].Cmd == "aibot_respond_msg" {
+			respond = &received[i]
+		}
+	}
+	if respond == nil {
+		t.Fatal("no respond frame received")
+	}
+	if respond.Headers.ReqID != "req-callback" {
+		t.Fatalf("respond req_id = %q, want req-callback", respond.Headers.ReqID)
+	}
+	var body RespondMsgBody
+	if err := json.Unmarshal(respond.Body, &body); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if body.MsgType != "image" || body.Image == nil || body.Image.MediaID != "media-1" {
+		t.Fatalf("unexpected body: %+v", body)
+	}
+	if body.Markdown != nil {
+		t.Fatalf("markdown should be omitted for image reply: %+v", body.Markdown)
+	}
+}
+
+func TestClientUploadMedia(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	var (
+		chunks    []UploadMediaChunkBody
+		initGot   UploadMediaInitBody
+		mu        sync.Mutex
+		connected = make(chan struct{})
+		once      sync.Once
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		var authReq Frame
+		if err := conn.ReadJSON(&authReq); err != nil {
+			return
+		}
+		if err := conn.WriteJSON(Frame{Cmd: "aibot_subscribe", ErrCode: 0}); err != nil {
+			return
+		}
+		once.Do(func() { close(connected) })
+
+		for {
+			var f Frame
+			if err := conn.ReadJSON(&f); err != nil {
+				return
+			}
+
+			// 响应帧不带 cmd，模拟真实协议，仅靠 req_id 关联
+			respond := func(body any) {
+				resp := Frame{Headers: Headers{ReqID: f.Headers.ReqID}, Body: mustMarshal(t, body)}
+				if err := conn.WriteJSON(resp); err != nil {
+					t.Errorf("write response: %v", err)
+				}
+			}
+
+			switch f.Cmd {
+			case "aibot_upload_media_init":
+				var body UploadMediaInitBody
+				if err := json.Unmarshal(f.Body, &body); err != nil {
+					t.Errorf("unmarshal init: %v", err)
+					return
+				}
+				mu.Lock()
+				initGot = body
+				mu.Unlock()
+				respond(UploadMediaInitResp{UploadID: "upload-1"})
+			case "aibot_upload_media_chunk":
+				var body UploadMediaChunkBody
+				if err := json.Unmarshal(f.Body, &body); err != nil {
+					t.Errorf("unmarshal chunk: %v", err)
+					return
+				}
+				mu.Lock()
+				chunks = append(chunks, body)
+				mu.Unlock()
+				respond(struct{}{})
+			case "aibot_upload_media_finish":
+				respond(UploadMediaFinishResp{MediaID: "media-final", Type: "image", CreatedAt: 1})
+			}
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
+	client := NewClient("bot-id", "secret", nil, logger).SetURL(wsTestURL(t, server))
+
+	var runWG sync.WaitGroup
+	runWG.Add(1)
+	go func() {
+		defer runWG.Done()
+		_ = client.Run(ctx)
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		cancel()
+		runWG.Wait()
+		t.Fatal("client did not connect in time")
+	}
+
+	data := bytes.Repeat([]byte{0x5A}, 1000)
+	mediaID, err := client.UploadMedia(ctx, "image", "cow.png", data)
+	if err != nil {
+		cancel()
+		runWG.Wait()
+		t.Fatalf("upload media: %v", err)
+	}
+	if mediaID != "media-final" {
+		t.Fatalf("mediaID = %q, want media-final", mediaID)
+	}
+
+	cancel()
+	runWG.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if initGot.Type != "image" || initGot.Filename != "cow.png" || initGot.TotalSize != 1000 || initGot.TotalChunks != 1 {
+		t.Fatalf("unexpected init body: %+v", initGot)
+	}
+	if len(chunks) != 1 || chunks[0].UploadID != "upload-1" || chunks[0].ChunkIndex != 0 {
+		t.Fatalf("unexpected chunks: %+v", chunks)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(chunks[0].Base64Data)
+	if err != nil {
+		t.Fatalf("decode chunk: %v", err)
+	}
+	if !bytes.Equal(decoded, data) {
+		t.Fatal("chunk data mismatch")
+	}
+}
+
+func TestClientUploadMediaErrorResponse(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	connected := make(chan struct{})
+	var once sync.Once
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		var authReq Frame
+		if err := conn.ReadJSON(&authReq); err != nil {
+			return
+		}
+		if err := conn.WriteJSON(Frame{Cmd: "aibot_subscribe", ErrCode: 0}); err != nil {
+			return
+		}
+		once.Do(func() { close(connected) })
+
+		for {
+			var f Frame
+			if err := conn.ReadJSON(&f); err != nil {
+				return
+			}
+			_ = conn.WriteJSON(Frame{
+				Headers: Headers{ReqID: f.Headers.ReqID},
+				ErrCode: 60011,
+				ErrMsg:  "no permission",
+			})
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
+	client := NewClient("bot-id", "secret", nil, logger).SetURL(wsTestURL(t, server))
+
+	var runWG sync.WaitGroup
+	runWG.Add(1)
+	go func() {
+		defer runWG.Done()
+		_ = client.Run(ctx)
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		cancel()
+		runWG.Wait()
+		t.Fatal("client did not connect in time")
+	}
+
+	_, err := client.UploadMedia(ctx, "image", "cow.png", bytes.Repeat([]byte{0x01}, 100))
+	cancel()
+	runWG.Wait()
+
+	if err == nil {
+		t.Fatal("expected error from errcode response")
+	}
+	if !strings.Contains(err.Error(), "60011") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestClientUploadMediaValidatesInput(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
+	client := NewClient("bot-id", "secret", nil, logger)
+
+	if _, err := client.UploadMedia(context.Background(), "image", "tiny.png", []byte{0x01}); err == nil {
+		t.Fatal("expected error for tiny media")
+	}
+
+	oversize := make([]byte, MaxImageMediaSize+1)
+	if _, err := client.UploadMedia(context.Background(), "image", "big.png", oversize); err == nil {
+		t.Fatal("expected error for oversize image")
+	}
+}
+
+func TestClientUploadMediaRetriesFailedChunk(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	var (
+		chunkAttempts int
+		initCount     int
+		mu            sync.Mutex
+		connected     = make(chan struct{})
+		once          sync.Once
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		var authReq Frame
+		if err := conn.ReadJSON(&authReq); err != nil {
+			return
+		}
+		if err := conn.WriteJSON(Frame{Cmd: "aibot_subscribe", ErrCode: 0}); err != nil {
+			return
+		}
+		once.Do(func() { close(connected) })
+
+		for {
+			var f Frame
+			if err := conn.ReadJSON(&f); err != nil {
+				return
+			}
+
+			respond := func(body any) {
+				resp := Frame{Headers: Headers{ReqID: f.Headers.ReqID}, Body: mustMarshal(t, body)}
+				if err := conn.WriteJSON(resp); err != nil {
+					t.Errorf("write response: %v", err)
+				}
+			}
+
+			switch f.Cmd {
+			case "aibot_upload_media_init":
+				mu.Lock()
+				initCount++
+				mu.Unlock()
+				respond(UploadMediaInitResp{UploadID: "upload-1"})
+			case "aibot_upload_media_chunk":
+				mu.Lock()
+				chunkAttempts++
+				attempt := chunkAttempts
+				mu.Unlock()
+				if attempt == 1 {
+					// 第一次分片上传失败，客户端应重试而不是放弃整个上传
+					_ = conn.WriteJSON(Frame{
+						Headers: Headers{ReqID: f.Headers.ReqID},
+						ErrCode: 500,
+						ErrMsg:  "server busy",
+					})
+					continue
+				}
+				respond(struct{}{})
+			case "aibot_upload_media_finish":
+				respond(UploadMediaFinishResp{MediaID: "media-final", Type: "image", CreatedAt: 1})
+			}
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
+	client := NewClient("bot-id", "secret", nil, logger).SetURL(wsTestURL(t, server))
+
+	var runWG sync.WaitGroup
+	runWG.Add(1)
+	go func() {
+		defer runWG.Done()
+		_ = client.Run(ctx)
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		cancel()
+		runWG.Wait()
+		t.Fatal("client did not connect in time")
+	}
+
+	mediaID, err := client.UploadMedia(ctx, "image", "cow.png", bytes.Repeat([]byte{0x5A}, 1000))
+	cancel()
+	runWG.Wait()
+
+	if err != nil {
+		t.Fatalf("upload media: %v", err)
+	}
+	if mediaID != "media-final" {
+		t.Fatalf("mediaID = %q, want media-final", mediaID)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if chunkAttempts != 2 {
+		t.Fatalf("chunk attempts = %d, want 2 (1 failure + 1 retry)", chunkAttempts)
+	}
+	if initCount != 1 {
+		t.Fatalf("init count = %d, want 1 (retry must not re-init)", initCount)
 	}
 }
 

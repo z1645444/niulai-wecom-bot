@@ -2,7 +2,9 @@ package wecom
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,6 +19,18 @@ const (
 	defaultWSURL      = "wss://openws.work.weixin.qq.com"
 	heartbeatPeriod   = 30 * time.Second
 	maxReconnectDelay = 60 * time.Second
+
+	// callTimeout 是需要等待响应的请求（如素材上传）的超时时间
+	callTimeout = 15 * time.Second
+
+	// 临时素材上传限制：单分片编码前不超过 512KB，分片数不超过 100
+	maxChunkSize = 512 * 1024
+	maxChunks    = 100
+	// maxChunkRetries 是单分片上传失败时的额外重试次数，与官方 SDK 行为一致
+	maxChunkRetries = 2
+
+	// MaxImageMediaSize 是图片素材的大小上限（10MB）
+	MaxImageMediaSize = 10 * 1024 * 1024
 )
 
 const (
@@ -48,10 +62,10 @@ type AuthBody struct {
 
 // SendMsgBody 是 aibot_send_msg 的 body
 type SendMsgBody struct {
-	ChatID   string   `json:"chatid"`
-	ChatType uint32   `json:"chat_type,omitempty"`
-	MsgType  string   `json:"msgtype"`
-	Markdown Markdown `json:"markdown"`
+	ChatID   string    `json:"chatid"`
+	ChatType uint32    `json:"chat_type,omitempty"`
+	MsgType  string    `json:"msgtype"`
+	Markdown *Markdown `json:"markdown,omitempty"`
 }
 
 // Markdown 是 markdown 消息体
@@ -59,10 +73,49 @@ type Markdown struct {
 	Content string `json:"content"`
 }
 
+// Image 是 image 消息体
+type Image struct {
+	MediaID string `json:"media_id"`
+}
+
 // RespondMsgBody 是 aibot_respond_msg 的 body
 type RespondMsgBody struct {
-	MsgType  string   `json:"msgtype"`
-	Markdown Markdown `json:"markdown"`
+	MsgType  string    `json:"msgtype"`
+	Markdown *Markdown `json:"markdown,omitempty"`
+	Image    *Image    `json:"image,omitempty"`
+}
+
+// UploadMediaInitBody 是 aibot_upload_media_init 的 body
+type UploadMediaInitBody struct {
+	Type        string `json:"type"`
+	Filename    string `json:"filename"`
+	TotalSize   int    `json:"total_size"`
+	TotalChunks int    `json:"total_chunks"`
+	MD5         string `json:"md5,omitempty"`
+}
+
+// UploadMediaInitResp 是 aibot_upload_media_init 的响应 body
+type UploadMediaInitResp struct {
+	UploadID string `json:"upload_id"`
+}
+
+// UploadMediaChunkBody 是 aibot_upload_media_chunk 的 body
+type UploadMediaChunkBody struct {
+	UploadID   string `json:"upload_id"`
+	ChunkIndex int    `json:"chunk_index"`
+	Base64Data string `json:"base64_data"`
+}
+
+// UploadMediaFinishBody 是 aibot_upload_media_finish 的 body
+type UploadMediaFinishBody struct {
+	UploadID string `json:"upload_id"`
+}
+
+// UploadMediaFinishResp 是 aibot_upload_media_finish 的响应 body
+type UploadMediaFinishResp struct {
+	MediaID   string `json:"media_id"`
+	Type      string `json:"type"`
+	CreatedAt int64  `json:"created_at"`
 }
 
 // MsgCallbackBody 是 aibot_msg_callback 的 body
@@ -121,6 +174,10 @@ type Client struct {
 
 	// sendCh 用于串行化出站帧，避免并发写 WebSocket
 	sendCh chan Frame
+
+	// pending 登记等待响应的出站请求，按 req_id 关联响应帧
+	pendingMu sync.Mutex
+	pending   map[string]chan Frame
 }
 
 // NewClient 创建一个新的 WS 客户端
@@ -132,6 +189,7 @@ func NewClient(botID, secret string, handler Handler, logger *slog.Logger) *Clie
 		handler: handler,
 		logger:  logger,
 		sendCh:  make(chan Frame, 64),
+		pending: make(map[string]chan Frame),
 	}
 }
 
@@ -303,6 +361,21 @@ func (c *Client) writeFrame(frame Frame) error {
 }
 
 func (c *Client) handleFrame(frame Frame) {
+	// 响应帧（errcode/errmsg）按 req_id 分发给等待中的请求；
+	// 响应帧可能没有 cmd，因此先按 pending 匹配再进入 cmd 分发
+	if frame.Headers.ReqID != "" {
+		c.pendingMu.Lock()
+		ch, ok := c.pending[frame.Headers.ReqID]
+		c.pendingMu.Unlock()
+		if ok {
+			select {
+			case ch <- frame:
+			default:
+			}
+			return
+		}
+	}
+
 	switch frame.Cmd {
 	case "aibot_msg_callback":
 		var body MsgCallbackBody
@@ -332,61 +405,159 @@ func (c *Client) handleFrame(frame Frame) {
 
 // SendMarkdown 主动发送 markdown 消息到指定会话
 func (c *Client) SendMarkdown(chatID string, chatType uint32, content string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return fmt.Errorf("client closed")
-	}
-	if c.conn == nil {
-		return fmt.Errorf("not connected")
-	}
-
-	body, err := json.Marshal(SendMsgBody{
+	return c.enqueue("aibot_send_msg", newReqID(), SendMsgBody{
 		ChatID:   chatID,
 		ChatType: chatType,
 		MsgType:  "markdown",
-		Markdown: Markdown{Content: content},
+		Markdown: &Markdown{Content: content},
 	})
-	if err != nil {
-		return fmt.Errorf("marshal send body: %w", err)
-	}
-
-	select {
-	case c.sendCh <- Frame{
-		Cmd:     "aibot_send_msg",
-		Headers: Headers{ReqID: newReqID()},
-		Body:    body,
-	}:
-		return nil
-	default:
-		return fmt.Errorf("send channel full")
-	}
 }
 
 // RespondMarkdown 被动回复 markdown 消息（回复 aibot_msg_callback）
 func (c *Client) RespondMarkdown(reqID, content string) error {
+	return c.enqueue("aibot_respond_msg", reqID, RespondMsgBody{
+		MsgType:  "markdown",
+		Markdown: &Markdown{Content: content},
+	})
+}
+
+// RespondImage 被动回复图片消息，mediaID 来自 UploadMedia
+func (c *Client) RespondImage(reqID, mediaID string) error {
+	return c.enqueue("aibot_respond_msg", reqID, RespondMsgBody{
+		MsgType: "image",
+		Image:   &Image{MediaID: mediaID},
+	})
+}
+
+// UploadMedia 通过 init/chunk/finish 三步上传临时素材，返回 media_id（3 天内有效）
+func (c *Client) UploadMedia(ctx context.Context, mediaType, filename string, data []byte) (string, error) {
+	if len(data) < 5 {
+		return "", fmt.Errorf("media too small: %d bytes", len(data))
+	}
+	if mediaType == "image" && len(data) > MaxImageMediaSize {
+		return "", fmt.Errorf("image too large: %d bytes, max %d", len(data), MaxImageMediaSize)
+	}
+	totalChunks := (len(data) + maxChunkSize - 1) / maxChunkSize
+	if totalChunks > maxChunks {
+		return "", fmt.Errorf("media requires %d chunks, max %d", totalChunks, maxChunks)
+	}
+
+	md5Sum := md5.Sum(data)
+	initResp, err := c.call(ctx, "aibot_upload_media_init", UploadMediaInitBody{
+		Type:        mediaType,
+		Filename:    filename,
+		TotalSize:   len(data),
+		TotalChunks: totalChunks,
+		MD5:         hex.EncodeToString(md5Sum[:]),
+	})
+	if err != nil {
+		return "", err
+	}
+	var init UploadMediaInitResp
+	if err := json.Unmarshal(initResp.Body, &init); err != nil {
+		return "", fmt.Errorf("unmarshal upload init response: %w", err)
+	}
+	if init.UploadID == "" {
+		return "", fmt.Errorf("upload init returned empty upload_id")
+	}
+
+	for i := 0; i < totalChunks; i++ {
+		start := i * maxChunkSize
+		end := start + maxChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := UploadMediaChunkBody{
+			UploadID:   init.UploadID,
+			ChunkIndex: i,
+			Base64Data: base64.StdEncoding.EncodeToString(data[start:end]),
+		}
+		// 单分片失败做有限重试，避免一次抖动导致整个上传失败
+		var err error
+		for attempt := 0; attempt <= maxChunkRetries; attempt++ {
+			if _, err = c.call(ctx, "aibot_upload_media_chunk", chunk); err == nil {
+				break
+			}
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+
+	finishResp, err := c.call(ctx, "aibot_upload_media_finish", UploadMediaFinishBody{UploadID: init.UploadID})
+	if err != nil {
+		return "", err
+	}
+	var finish UploadMediaFinishResp
+	if err := json.Unmarshal(finishResp.Body, &finish); err != nil {
+		return "", fmt.Errorf("unmarshal upload finish response: %w", err)
+	}
+	if finish.MediaID == "" {
+		return "", fmt.Errorf("upload finish returned empty media_id")
+	}
+	return finish.MediaID, nil
+}
+
+// call 发送一个需要等待响应的请求帧，按 req_id 关联响应
+func (c *Client) call(ctx context.Context, cmd string, body any) (Frame, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return Frame{}, fmt.Errorf("marshal %s body: %w", cmd, err)
+	}
+
+	reqID := newReqID()
+	ch := make(chan Frame, 1)
+	c.pendingMu.Lock()
+	c.pending[reqID] = ch
+	c.pendingMu.Unlock()
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, reqID)
+		c.pendingMu.Unlock()
+	}()
+
+	if err := c.writeFrame(Frame{Cmd: cmd, Headers: Headers{ReqID: reqID}, Body: raw}); err != nil {
+		return Frame{}, fmt.Errorf("send %s: %w", cmd, err)
+	}
+
+	timer := time.NewTimer(callTimeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return Frame{}, ctx.Err()
+	case <-timer.C:
+		return Frame{}, fmt.Errorf("%s: response timeout", cmd)
+	case resp := <-ch:
+		if resp.ErrCode != 0 {
+			return Frame{}, fmt.Errorf("%s: errcode=%d, errmsg=%s", cmd, resp.ErrCode, resp.ErrMsg)
+		}
+		return resp, nil
+	}
+}
+
+// enqueue 序列化 body 并把帧送入出站队列（异步，不等待对端响应）
+func (c *Client) enqueue(cmd, reqID string, body any) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return fmt.Errorf("client closed")
 	}
 	if c.conn == nil {
+		c.mu.Unlock()
 		return fmt.Errorf("not connected")
 	}
+	c.mu.Unlock()
 
-	body, err := json.Marshal(RespondMsgBody{
-		MsgType:  "markdown",
-		Markdown: Markdown{Content: content},
-	})
+	raw, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("marshal respond body: %w", err)
+		return fmt.Errorf("marshal %s body: %w", cmd, err)
 	}
 
 	select {
 	case c.sendCh <- Frame{
-		Cmd:     "aibot_respond_msg",
+		Cmd:     cmd,
 		Headers: Headers{ReqID: reqID},
-		Body:    body,
+		Body:    raw,
 	}:
 		return nil
 	default:
