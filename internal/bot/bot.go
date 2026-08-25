@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,7 +38,6 @@ type Sender interface {
 // NiuLai 是虚拟员工“牛来”的业务编排器
 type NiuLai struct {
 	cfg       *config.Config
-	machine   *state.Machine
 	client    Sender
 	scheduler *scheduler.Scheduler
 	logger    *slog.Logger
@@ -46,6 +46,11 @@ type NiuLai struct {
 	// TARGET_CHAT_ID 配置中。
 	chatsMu sync.RWMutex
 	chats   map[string]struct{}
+
+	// sessions 按群聊维护相互独立的会话（状态机与 SCREAMING 生命周期）：
+	// 一个群的触发、停止与冷却不影响其他群
+	sessionsMu sync.Mutex
+	sessions   map[string]*chatSession
 
 	// failures 记录每个 chatid 的连续发送失败次数，与是否自动发现无关
 	failuresMu sync.Mutex
@@ -60,11 +65,6 @@ type NiuLai struct {
 	mediaMu    sync.Mutex
 	mediaCache map[string]string
 
-	// screamCtx/screamCancel 控制当前 SCREAMING 会话的生命周期
-	screamMu     sync.Mutex
-	screamCtx    context.Context
-	screamCancel context.CancelFunc
-
 	// sleep 控制 screamLoop 的等待行为，便于测试注入
 	sleep func(context.Context, time.Duration) bool
 
@@ -77,6 +77,38 @@ type NiuLai struct {
 	wg      sync.WaitGroup
 }
 
+// chatSession 是单个群聊的独立会话：状态机与 SCREAMING 上下文均按群隔离
+type chatSession struct {
+	machine *state.Machine
+
+	// mu 保护 cancel，即当前 SCREAMING 循环的取消函数
+	mu     sync.Mutex
+	cancel context.CancelFunc
+}
+
+// startScreamCtx 创建该会话新的 SCREAMING 上下文，并取消旧上下文
+func (s *chatSession) startScreamCtx(parent context.Context) context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.cancel != nil {
+		s.cancel()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.cancel = cancel
+	return ctx
+}
+
+// cancelScream 取消该会话当前的 SCREAMING 上下文
+func (s *chatSession) cancelScream() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+}
+
 // New 创建一个新的牛来实例
 func New(cfg *config.Config, client Sender, logger *slog.Logger) *NiuLai {
 	// 空值回退默认，保证绕过 config.Load 的调用方（如测试）行为确定
@@ -86,13 +118,12 @@ func New(cfg *config.Config, client Sender, logger *slog.Logger) *NiuLai {
 	if cfg.ScreamContent == "" {
 		cfg.ScreamContent = config.DefaultScreamContent
 	}
-	machine := state.NewMachine()
 	nl := &NiuLai{
 		cfg:        cfg,
-		machine:    machine,
 		client:     client,
 		logger:     logger,
 		chats:      make(map[string]struct{}),
+		sessions:   make(map[string]*chatSession),
 		failures:   make(map[string]int),
 		triggered:  make(map[string]string),
 		mediaCache: make(map[string]string),
@@ -101,8 +132,8 @@ func New(cfg *config.Config, client Sender, logger *slog.Logger) *NiuLai {
 	}
 	// 默认上下文，避免测试绕过 Start 时访问 nil ctx
 	nl.ctx = context.Background()
-	nl.scheduler = scheduler.New(cfg, machine, nl.onTrigger)
-	nl.scheduler.SetPendingToday(nl.hasPendingChatToday)
+	nl.scheduler = scheduler.New(cfg, nl.targetChatIDs, nl.machineFor, nl.onTrigger)
+	nl.scheduler.SetPendingToday(nl.hasPendingChat)
 	return nl
 }
 
@@ -151,7 +182,7 @@ func (nl *NiuLai) Stop() {
 		nl.cancel()
 	}
 	nl.scheduler.Stop()
-	nl.cancelScream()
+	nl.cancelAllScreams()
 	nl.wg.Wait()
 	nl.logger.Info("niulai stopped")
 }
@@ -164,6 +195,7 @@ func (nl *NiuLai) SetClient(client Sender) {
 // OnMessage 实现 wecom.Handler，处理收到的用户消息。
 // 文本剥离开头的 @提及 后仍包含停止关键词（默认“牛来”）即触发停止，
 // 不依赖企业微信回调中的 @ 字段。
+// 停止只作用于消息来源的群聊：该群进入冷却，其他群的 SCREAMING 不受影响。
 func (nl *NiuLai) OnMessage(reqID string, body *wecom.MsgCallbackBody) {
 	if body == nil {
 		return
@@ -191,13 +223,22 @@ func (nl *NiuLai) OnMessage(reqID string, body *wecom.MsgCallbackBody) {
 		return
 	}
 
-	cooldown := time.Duration(nl.cfg.CooldownMinutes) * time.Minute
-	if !nl.machine.StopScreaming(cooldown) {
-		nl.logger.Info("stop command ignored: not screaming", "state", nl.machine.Current())
+	session := nl.findSession(body.ChatID)
+	if session == nil {
+		nl.logger.Info("stop command ignored: chat has no session", "chatid", body.ChatID)
 		return
 	}
 
-	nl.cancelScream()
+	cooldown := time.Duration(nl.cfg.CooldownMinutes) * time.Minute
+	if !session.machine.StopScreaming(cooldown) {
+		nl.logger.Info("stop command ignored: not screaming",
+			"state", session.machine.Current(),
+			"chatid", body.ChatID,
+		)
+		return
+	}
+
+	session.cancelScream()
 
 	nl.logger.Info("stop command accepted", "from", body.From.UserID, "chatid", body.ChatID)
 
@@ -399,45 +440,92 @@ func stripLeadingMentions(s string) string {
 	return s
 }
 
-func (nl *NiuLai) onTrigger() {
-	if !nl.machine.StartScreaming() {
+// sessionFor 返回指定群聊的会话，不存在时创建（初始为 IDLE）
+func (nl *NiuLai) sessionFor(chatID string) *chatSession {
+	nl.sessionsMu.Lock()
+	defer nl.sessionsMu.Unlock()
+
+	session, ok := nl.sessions[chatID]
+	if !ok {
+		session = &chatSession{machine: state.NewMachine()}
+		nl.sessions[chatID] = session
+	}
+	return session
+}
+
+// findSession 返回指定群聊的已有会话，不存在时返回 nil（不创建）
+func (nl *NiuLai) findSession(chatID string) *chatSession {
+	nl.sessionsMu.Lock()
+	defer nl.sessionsMu.Unlock()
+	return nl.sessions[chatID]
+}
+
+// machineFor 返回指定群聊的独立状态机，供调度器按群判定触发
+func (nl *NiuLai) machineFor(chatID string) *state.Machine {
+	return nl.sessionFor(chatID).machine
+}
+
+func (nl *NiuLai) onTrigger(chatID string) {
+	// 读锁贯穿成员校验、会话创建与 SCREAMING 上下文建立，使失败驱逐无法
+	// 交错进来：要么校验时群已被移出目标列表、放弃触发；要么驱逐晚于上下文
+	// 建立，由 evictSession 正常取消本次循环。否则调度 tick 的快照与驱逐
+	// 交错时可能为已驱逐的群重建会话，启动无法再被驱逐的发送循环
+	nl.chatsMu.RLock()
+	defer nl.chatsMu.RUnlock()
+
+	// 不能直接调 targetChatIDs()：已持有读锁，Go 的 RWMutex 读锁不可重入，
+	// 一旦有写者等待，再次 RLock 会死锁
+	if !slices.Contains(config.ParseTargetChatIDs(nl.cfg.TargetChatID), chatID) {
+		nl.logger.Warn("trigger ignored: chat is no longer a target", "chatid", chatID)
 		return
 	}
 
-	nl.logger.Info("event triggered, start screaming")
+	session := nl.sessionFor(chatID)
+	if !session.machine.StartScreaming() {
+		return
+	}
 
-	screamCtx := nl.startScreamCtx()
+	nl.logger.Info("event triggered, start screaming", "chatid", chatID)
+
+	screamCtx := session.startScreamCtx(nl.ctx)
 
 	nl.wg.Add(1)
 	go func() {
 		defer nl.wg.Done()
-		nl.screamLoop(screamCtx)
+		nl.screamLoop(screamCtx, session, chatID)
 	}()
 }
 
-// startScreamCtx 创建新的 SCREAMING 上下文，并取消旧的上下文
-func (nl *NiuLai) startScreamCtx() context.Context {
-	nl.screamMu.Lock()
-	defer nl.screamMu.Unlock()
-
-	if nl.screamCancel != nil {
-		nl.screamCancel()
+// cancelAllScreams 取消所有群聊的 SCREAMING 上下文
+func (nl *NiuLai) cancelAllScreams() {
+	nl.sessionsMu.Lock()
+	sessions := make([]*chatSession, 0, len(nl.sessions))
+	for _, session := range nl.sessions {
+		sessions = append(sessions, session)
 	}
-	nl.screamCtx, nl.screamCancel = context.WithCancel(nl.ctx)
-	return nl.screamCtx
-}
+	nl.sessionsMu.Unlock()
 
-// cancelScream 取消当前 SCREAMING 上下文
-func (nl *NiuLai) cancelScream() {
-	nl.screamMu.Lock()
-	defer nl.screamMu.Unlock()
-	if nl.screamCancel != nil {
-		nl.screamCancel()
-		nl.screamCancel = nil
+	for _, session := range sessions {
+		session.cancelScream()
 	}
 }
 
-func (nl *NiuLai) screamLoop(ctx context.Context) {
+// evictSession 终止并删除指定群聊的会话：被移出目标列表的群不再发送，
+// 之后若被重新发现，将以全新的 IDLE 会话参与触发
+func (nl *NiuLai) evictSession(chatID string) {
+	nl.sessionsMu.Lock()
+	session, ok := nl.sessions[chatID]
+	if ok {
+		delete(nl.sessions, chatID)
+	}
+	nl.sessionsMu.Unlock()
+
+	if ok {
+		session.cancelScream()
+	}
+}
+
+func (nl *NiuLai) screamLoop(ctx context.Context, session *chatSession, chatID string) {
 	for {
 		select {
 		case <-nl.ctx.Done():
@@ -447,7 +535,7 @@ func (nl *NiuLai) screamLoop(ctx context.Context) {
 		default:
 		}
 
-		if nl.machine.Current() != state.SCREAMING {
+		if session.machine.Current() != state.SCREAMING {
 			return
 		}
 
@@ -460,10 +548,10 @@ func (nl *NiuLai) screamLoop(ctx context.Context) {
 		default:
 		}
 
-		nl.sendScreamToTargets(ctx)
+		nl.sendScream(chatID)
 
 		interval := nl.cfg.RandomInterval()
-		nl.logger.Debug("next scream interval", "interval", interval)
+		nl.logger.Debug("next scream interval", "chatid", chatID, "interval", interval)
 
 		if !nl.sleep(ctx, interval) {
 			return
@@ -471,37 +559,21 @@ func (nl *NiuLai) screamLoop(ctx context.Context) {
 	}
 }
 
-// sendScreamToTargets 向所有目标群聊发送喊话内容，并清理连续失败过多的群聊
-func (nl *NiuLai) sendScreamToTargets(ctx context.Context) {
-	chatIDs := nl.targetChatIDs()
-	if len(chatIDs) == 0 {
-		nl.logger.Warn("no target chats available, screaming will not send messages")
+// sendScream 向指定群聊发送一次喊话内容；连续失败过多的群聊会被移出目标列表
+func (nl *NiuLai) sendScream(chatID string) {
+	if err := nl.client.SendMarkdown(chatID, wecom.ChatTypeGroup, nl.cfg.ScreamContent); err != nil {
+		failures := nl.recordSendFailure(chatID)
+		nl.logger.Warn("failed to send scream message",
+			"chatid", chatID,
+			"err", err,
+			"failures", failures,
+			"max_failures", nl.cfg.MaxSendFailures,
+		)
 		return
 	}
-
-	for _, chatID := range chatIDs {
-		select {
-		case <-nl.ctx.Done():
-			return
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		if err := nl.client.SendMarkdown(chatID, wecom.ChatTypeGroup, nl.cfg.ScreamContent); err != nil {
-			failures := nl.recordSendFailure(chatID)
-			nl.logger.Warn("failed to send scream message",
-				"chatid", chatID,
-				"err", err,
-				"failures", failures,
-				"max_failures", nl.cfg.MaxSendFailures,
-			)
-		} else {
-			nl.resetSendFailures(chatID)
-			nl.markTriggered(chatID)
-			nl.logger.Info("scream sent", "chatid", chatID, "content", nl.cfg.ScreamContent)
-		}
-	}
+	nl.resetSendFailures(chatID)
+	nl.markTriggered(chatID)
+	nl.logger.Info("scream sent", "chatid", chatID, "content", nl.cfg.ScreamContent)
 }
 
 // markTriggered 记录该群聊今天已经成功触发过事件
@@ -511,17 +583,12 @@ func (nl *NiuLai) markTriggered(chatID string) {
 	nl.triggered[chatID] = nl.now().Format("2006-01-02")
 }
 
-// hasPendingChatToday 报告当前目标群聊中是否仍有今天未触发过的群
-func (nl *NiuLai) hasPendingChatToday() bool {
+// hasPendingChat 报告指定群聊当天是否尚未成功触发
+func (nl *NiuLai) hasPendingChat(chatID string) bool {
 	today := nl.now().Format("2006-01-02")
 	nl.triggeredMu.Lock()
 	defer nl.triggeredMu.Unlock()
-	for _, chatID := range nl.targetChatIDs() {
-		if nl.triggered[chatID] != today {
-			return true
-		}
-	}
-	return false
+	return nl.triggered[chatID] != today
 }
 
 func (nl *NiuLai) recordSendFailure(chatID string) int {
@@ -558,6 +625,10 @@ func (nl *NiuLai) recordSendFailure(chatID string) int {
 			)
 		}
 		nl.chatsMu.Unlock()
+
+		if discovered || removedFromTargets {
+			nl.evictSession(chatID)
+		}
 	}
 
 	return failures

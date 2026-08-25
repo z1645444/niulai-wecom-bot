@@ -441,7 +441,8 @@ func TestStopCommandRepliesDefaultText(t *testing.T) {
 	nl := New(&config.Config{CooldownMinutes: 1}, fake, logger)
 	nl.SetClient(fake)
 
-	if !nl.machine.StartScreaming() {
+	session := nl.sessionFor("chat-1")
+	if !session.machine.StartScreaming() {
 		t.Fatal("failed to start screaming")
 	}
 
@@ -454,8 +455,8 @@ func TestStopCommandRepliesDefaultText(t *testing.T) {
 		Mention: []wecom.Mention{{UserID: "bot-1", Type: 1}},
 	})
 
-	if nl.machine.Current() != state.COOLDOWN {
-		t.Fatalf("state = %v, want COOLDOWN", nl.machine.Current())
+	if session.machine.Current() != state.COOLDOWN {
+		t.Fatalf("state = %v, want COOLDOWN", session.machine.Current())
 	}
 
 	// 完成回复是异步发出的，需要等待
@@ -482,7 +483,7 @@ func TestStopCommandRepliesConfiguredText(t *testing.T) {
 	}, fake, logger)
 	nl.SetClient(fake)
 
-	if !nl.machine.StartScreaming() {
+	if !nl.sessionFor("chat-1").machine.StartScreaming() {
 		t.Fatal("failed to start screaming")
 	}
 
@@ -733,7 +734,7 @@ func TestOnMessageImageReplyOverRealClient(t *testing.T) {
 		SetURL("ws" + strings.TrimPrefix(wsServer.URL, "http"))
 	nl.SetClient(client)
 
-	if !nl.machine.StartScreaming() {
+	if !nl.sessionFor("chat-1").machine.StartScreaming() {
 		t.Fatal("failed to start screaming")
 	}
 
@@ -820,7 +821,8 @@ func TestStopCommandStartsCooldownOnKeywordWithoutMention(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	nl := New(&config.Config{CooldownMinutes: 1}, nil, logger)
 
-	if !nl.machine.StartScreaming() {
+	session := nl.sessionFor("chat-1")
+	if !session.machine.StartScreaming() {
 		t.Fatal("failed to start screaming")
 	}
 
@@ -830,12 +832,12 @@ func TestStopCommandStartsCooldownOnKeywordWithoutMention(t *testing.T) {
 		Text:    wecom.TextBody{Content: "牛来"},
 	})
 
-	if nl.machine.Current() != state.COOLDOWN {
-		t.Fatalf("state = %v, want %v", nl.machine.Current(), state.COOLDOWN)
+	if session.machine.Current() != state.COOLDOWN {
+		t.Fatalf("state = %v, want %v", session.machine.Current(), state.COOLDOWN)
 	}
 }
 
-func TestScreamLoopSendsToMultipleChats(t *testing.T) {
+func TestScreamLoopsRunPerChat(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	fake := &fakeSender{}
 	cfg := &config.Config{
@@ -851,20 +853,22 @@ func TestScreamLoopSendsToMultipleChats(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	nl.ctx, nl.cancel = ctx, cancel
 
-	if !nl.machine.StartScreaming() {
-		t.Fatal("failed to start screaming")
+	for _, chatID := range []string{"chat-1", "chat-2"} {
+		session := nl.sessionFor(chatID)
+		if !session.machine.StartScreaming() {
+			t.Fatalf("failed to start screaming for %s", chatID)
+		}
+		screamCtx := session.startScreamCtx(nl.ctx)
+
+		nl.wg.Add(1)
+		go func(session *chatSession, chatID string) {
+			defer nl.wg.Done()
+			nl.screamLoop(screamCtx, session, chatID)
+		}(session, chatID)
 	}
 
-	screamCtx, screamCancel := context.WithCancel(nl.ctx)
-
-	nl.wg.Add(1)
-	go func() {
-		defer nl.wg.Done()
-		nl.screamLoop(screamCtx)
-	}()
-
 	time.Sleep(50 * time.Millisecond)
-	screamCancel()
+	cancel()
 
 	done := make(chan struct{})
 	go func() {
@@ -875,7 +879,7 @@ func TestScreamLoopSendsToMultipleChats(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("screamLoop did not stop promptly")
+		t.Fatal("screamLoops did not stop promptly")
 	}
 
 	fake.mu.Lock()
@@ -895,7 +899,200 @@ func TestScreamLoopSendsToMultipleChats(t *testing.T) {
 	}
 }
 
-func TestScreamLoopUsesTargetChatID(t *testing.T) {
+// TestStopCommandOnlyStopsOriginatingChat 是会话隔离的回归测试：
+// 一个群收到停止指令后，只有该群停止并进入冷却，其他群继续发送
+func TestStopCommandOnlyStopsOriginatingChat(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	cfg := &config.Config{
+		CooldownMinutes:    1,
+		MinIntervalSeconds: 600,
+		MaxIntervalSeconds: 600,
+	}
+	nl := New(cfg, fake, logger)
+	nl.SetClient(fake)
+	// 加快发送节奏，避免测试受真实间隔影响
+	nl.sleep = func(ctx context.Context, _ time.Duration) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(10 * time.Millisecond):
+			return true
+		}
+	}
+	nl.captureChatID("group", "chat-1")
+	nl.captureChatID("group", "chat-2")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	nl.ctx, nl.cancel = ctx, cancel
+	defer func() {
+		cancel()
+		done := make(chan struct{})
+		go func() {
+			nl.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("scream loops did not stop after cancel")
+		}
+	}()
+
+	nl.onTrigger("chat-1")
+	nl.onTrigger("chat-2")
+
+	// 等两个群都至少发出一条
+	waitFor(t, "initial screams from both chats", func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		seen := make(map[string]bool)
+		for _, c := range fake.sends {
+			seen[c.chatID] = true
+		}
+		return seen["chat-1"] && seen["chat-2"]
+	})
+
+	// chat-1 收到停止指令
+	nl.OnMessage("req-1", &wecom.MsgCallbackBody{
+		MsgType: "text",
+		ChatID:  "chat-1",
+		Text:    wecom.TextBody{Content: "牛来"},
+	})
+
+	if got := nl.sessionFor("chat-1").machine.Current(); got != state.COOLDOWN {
+		t.Fatalf("chat-1 state = %v, want COOLDOWN", got)
+	}
+	if got := nl.sessionFor("chat-2").machine.Current(); got != state.SCREAMING {
+		t.Fatalf("chat-2 state = %v, want SCREAMING", got)
+	}
+
+	counts := func() (int, int) {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		var c1, c2 int
+		for _, c := range fake.sends {
+			switch c.chatID {
+			case "chat-1":
+				c1++
+			case "chat-2":
+				c2++
+			}
+		}
+		return c1, c2
+	}
+
+	// 给 chat-1 的循环留出退出窗口后采样：chat-1 不得再增长，chat-2 必须继续增长
+	time.Sleep(50 * time.Millisecond)
+	before1, before2 := counts()
+	time.Sleep(150 * time.Millisecond)
+	after1, after2 := counts()
+
+	if after1 != before1 {
+		t.Fatalf("chat-1 kept sending after stop: before=%d after=%d", before1, after1)
+	}
+	if after2 <= before2 {
+		t.Fatalf("chat-2 stopped sending after chat-1 stop: before=%d after=%d", before2, after2)
+	}
+}
+
+// TestOnTriggerSkipsNonTargetChat 是触发与驱逐交错的回归测试：
+// onTrigger 不得为已不在目标列表中的群创建会话、启动发送循环，
+// 否则该循环无法再被失败驱逐终止，会一直泄漏到进程重启
+func TestOnTriggerSkipsNonTargetChat(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	cfg := &config.Config{
+		CooldownMinutes:    1,
+		MinIntervalSeconds: 600,
+		MaxIntervalSeconds: 600,
+	}
+	nl := New(cfg, fake, logger)
+	nl.SetClient(fake)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	nl.ctx, nl.cancel = ctx, cancel
+
+	nl.onTrigger("ghost-chat")
+
+	if s := nl.findSession("ghost-chat"); s != nil {
+		t.Fatal("expected no session created for non-target chat")
+	}
+
+	// 若循环被错误启动，第一条喊话会立即发出
+	time.Sleep(50 * time.Millisecond)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.sends) != 0 {
+		t.Fatalf("expected no sends to non-target chat, got %d", len(fake.sends))
+	}
+}
+
+// TestRediscoveredChatGetsFreshSession 验证约束：被失败驱逐的群重新发现后，
+// 以全新的 IDLE 会话参与触发，而不是沿用被驱逐时的会话
+func TestRediscoveredChatGetsFreshSession(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{failSend: true}
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 2}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	// 模拟事件进行中被驱逐：会话处于 SCREAMING 时连续失败达到上限
+	evicted := nl.sessionFor("chat-1")
+	if !evicted.machine.StartScreaming() {
+		t.Fatal("failed to start screaming")
+	}
+	nl.sendScream("chat-1")
+	nl.sendScream("chat-1")
+
+	if got := nl.targetChatIDs(); len(got) != 0 {
+		t.Fatalf("expected chat evicted, targets = %v", got)
+	}
+	if s := nl.findSession("chat-1"); s != nil {
+		t.Fatal("expected session removed after eviction")
+	}
+
+	nl.captureChatID("group", "chat-1")
+
+	if got := nl.targetChatIDs(); len(got) != 1 {
+		t.Fatalf("expected chat rediscovered, targets = %v", got)
+	}
+	fresh := nl.sessionFor("chat-1")
+	if fresh == evicted {
+		t.Fatal("expected a brand-new session after rediscovery")
+	}
+	if got := fresh.machine.Current(); got != state.IDLE {
+		t.Fatalf("state = %v, want IDLE", got)
+	}
+}
+
+// TestStopCommandIgnoredWithoutSession 验证没有会话的群收到停止指令时
+// 直接忽略：不创建会话，也不回复完成消息
+func TestStopCommandIgnoredWithoutSession(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	nl := New(&config.Config{CooldownMinutes: 1}, fake, logger)
+	nl.SetClient(fake)
+
+	nl.OnMessage("req-1", &wecom.MsgCallbackBody{
+		MsgType: "text",
+		ChatID:  "chat-1",
+		Text:    wecom.TextBody{Content: "牛来"},
+	})
+
+	if s := nl.findSession("chat-1"); s != nil {
+		t.Fatal("stop command must not create a session")
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.responds) != 0 || len(fake.respondImages) != 0 {
+		t.Fatalf("expected no finish reply, got responds=%v images=%v", fake.responds, fake.respondImages)
+	}
+}
+
+func TestScreamLoopSendsToOwnChat(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	fake := &fakeSender{}
 	cfg := &config.Config{
@@ -910,7 +1107,8 @@ func TestScreamLoopUsesTargetChatID(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	nl.ctx, nl.cancel = ctx, cancel
 
-	if !nl.machine.StartScreaming() {
+	session := nl.sessionFor("target-chat")
+	if !session.machine.StartScreaming() {
 		t.Fatal("failed to start screaming")
 	}
 
@@ -919,7 +1117,7 @@ func TestScreamLoopUsesTargetChatID(t *testing.T) {
 	nl.wg.Add(1)
 	go func() {
 		defer nl.wg.Done()
-		nl.screamLoop(screamCtx)
+		nl.screamLoop(screamCtx, session, "target-chat")
 	}()
 
 	time.Sleep(150 * time.Millisecond)
@@ -928,6 +1126,9 @@ func TestScreamLoopUsesTargetChatID(t *testing.T) {
 
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
+	if len(fake.sends) == 0 {
+		t.Fatal("expected at least one scream message")
+	}
 	for _, c := range fake.sends {
 		if c.chatID != "target-chat" {
 			t.Fatalf("unexpected chatID: %q", c.chatID)
@@ -956,33 +1157,38 @@ func TestFailureEviction(t *testing.T) {
 	nl.captureChatID("group", "chat-2")
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	nl.ctx, nl.cancel = ctx, cancel
 
-	if !nl.machine.StartScreaming() {
-		t.Fatal("failed to start screaming")
-	}
+	nl.onTrigger("chat-1")
+	nl.onTrigger("chat-2")
 
-	screamCtx, screamCancel := context.WithCancel(nl.ctx)
+	// 两个群各自连续失败 2 次后都应被移出目标列表
+	waitFor(t, "eviction of both chats", func() bool {
+		return len(nl.targetChatIDs()) == 0
+	})
 
-	nl.wg.Add(1)
+	// 会话随驱逐终止，循环应自行退出
+	done := make(chan struct{})
 	go func() {
-		defer nl.wg.Done()
-		nl.screamLoop(screamCtx)
+		nl.wg.Wait()
+		close(done)
 	}()
-
-	time.Sleep(1100 * time.Millisecond)
-	screamCancel()
-	nl.wg.Wait()
-
-	// chat-1 应该因连续失败 2 次被移除
-	nl.chatsMu.RLock()
-	_, ok := nl.chats["chat-1"]
-	nl.chatsMu.RUnlock()
-	if ok {
-		t.Fatal("expected chat-1 to be evicted after failures")
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scream loops did not stop after eviction")
 	}
-	if got := nl.targetChatIDs(); len(got) != 0 {
-		t.Fatalf("targetChatIDs after eviction = %v, want []", got)
+
+	nl.chatsMu.RLock()
+	_, ok1 := nl.chats["chat-1"]
+	_, ok2 := nl.chats["chat-2"]
+	nl.chatsMu.RUnlock()
+	if ok1 || ok2 {
+		t.Fatal("expected both chats to be evicted after failures")
+	}
+	if s := nl.findSession("chat-1"); s != nil {
+		t.Fatal("expected chat-1 session removed after eviction")
 	}
 
 	fake.mu.Lock()
@@ -999,7 +1205,7 @@ func TestFailureResetOnSuccess(t *testing.T) {
 	nl.SetClient(fake)
 	nl.captureChatID("group", "chat-1")
 
-	nl.sendScreamToTargets(context.Background())
+	nl.sendScream("chat-1")
 	if nl.getSendFailures("chat-1") != 0 {
 		t.Fatalf("expected failures reset to 0, got %d", nl.getSendFailures("chat-1"))
 	}
@@ -1012,7 +1218,7 @@ func TestConfiguredTargetTracksFailures(t *testing.T) {
 	nl.SetClient(fake)
 
 	for i := 0; i < 3; i++ {
-		nl.sendScreamToTargets(context.Background())
+		nl.sendScream("target-chat")
 	}
 
 	if got := nl.targetChatIDs(); len(got) != 0 {
@@ -1030,19 +1236,22 @@ func TestDailyTriggerTracking(t *testing.T) {
 	nl.SetClient(fake)
 	nl.captureChatID("group", "chat-1")
 
-	if !nl.hasPendingChatToday() {
+	if !nl.hasPendingChat("chat-1") {
 		t.Fatal("expected pending before any trigger")
 	}
 
-	nl.sendScreamToTargets(context.Background())
-	if nl.hasPendingChatToday() {
+	nl.sendScream("chat-1")
+	if nl.hasPendingChat("chat-1") {
 		t.Fatal("expected no pending after successful send")
 	}
 
-	// 新发现的群聊当天未触发，应重新进入待触发状态
+	// 新发现的群聊当天未触发，仍处于待触发；已触发的群不受影响
 	nl.captureChatID("group", "chat-2")
-	if !nl.hasPendingChatToday() {
+	if !nl.hasPendingChat("chat-2") {
 		t.Fatal("expected pending for newly discovered chat")
+	}
+	if nl.hasPendingChat("chat-1") {
+		t.Fatal("expected chat-1 to remain triggered")
 	}
 }
 
@@ -1056,14 +1265,14 @@ func TestDailyTriggerTrackingResetsAcrossDays(t *testing.T) {
 	current := time.Date(2026, 8, 24, 10, 0, 0, 0, time.Local)
 	nl.now = func() time.Time { return current }
 
-	nl.sendScreamToTargets(context.Background())
-	if nl.hasPendingChatToday() {
+	nl.sendScream("chat-1")
+	if nl.hasPendingChat("chat-1") {
 		t.Fatal("expected no pending after successful send")
 	}
 
 	// 跨天后同群重新进入待触发
 	current = current.AddDate(0, 0, 1)
-	if !nl.hasPendingChatToday() {
+	if !nl.hasPendingChat("chat-1") {
 		t.Fatal("expected pending on the next day")
 	}
 }
@@ -1075,8 +1284,8 @@ func TestFailedSendDoesNotMarkTriggered(t *testing.T) {
 	nl.SetClient(fake)
 	nl.captureChatID("group", "chat-1")
 
-	nl.sendScreamToTargets(context.Background())
-	if !nl.hasPendingChatToday() {
+	nl.sendScream("chat-1")
+	if !nl.hasPendingChat("chat-1") {
 		t.Fatal("expected pending when send fails")
 	}
 }

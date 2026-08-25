@@ -11,16 +11,17 @@ import (
 	"niulai-wecom-bot/internal/state"
 )
 
-// Scheduler 负责在工作时间内随机触发牛来事件
+// Scheduler 负责在工作时间内为每个目标群聊独立随机触发牛来事件
 type Scheduler struct {
 	cfg        *config.Config
-	machine    *state.Machine
-	onTrigger  func()
+	chats      func() []string
+	machineFor func(chatID string) *state.Machine
+	onTrigger  func(chatID string)
 	checkEvery time.Duration
 
-	// pendingToday 报告是否存在当天尚未触发的目标群聊，用于每日保底触发；
+	// pendingToday 报告指定群聊当天是否尚未触发，用于每日保底触发；
 	// 由业务方注入，未设置时保底逻辑不生效
-	pendingToday func() bool
+	pendingToday func(chatID string) bool
 
 	// 可注入的依赖，便于测试
 	now      func() time.Time
@@ -34,12 +35,14 @@ type Scheduler struct {
 	stopOnce sync.Once
 }
 
-// New 创建一个新的调度器
-// onTrigger 是触发成功时的回调，由调用方负责把状态切换到 SCREAMING
-func New(cfg *config.Config, machine *state.Machine, onTrigger func()) *Scheduler {
+// New 创建一个新的调度器。
+// chats 返回当前目标群聊列表；machineFor 返回指定群聊的独立状态机；
+// onTrigger 是单个群聊触发成功时的回调，由调用方负责把该群状态切换到 SCREAMING
+func New(cfg *config.Config, chats func() []string, machineFor func(chatID string) *state.Machine, onTrigger func(chatID string)) *Scheduler {
 	return &Scheduler{
 		cfg:        cfg,
-		machine:    machine,
+		chats:      chats,
+		machineFor: machineFor,
 		onTrigger:  onTrigger,
 		checkEvery: 5 * time.Minute,
 		stopCh:     make(chan struct{}),
@@ -90,35 +93,38 @@ func (s *Scheduler) Stop() {
 }
 
 func (s *Scheduler) tick() {
-	// 先检查冷却是否到期
-	if s.machine.ResetCooldown() {
-		// 冷却结束回到 IDLE，继续下面的触发判断
-	}
-
 	now := s.now()
-	current := s.machine.Current()
+	workTime := s.cfg.IsWorkTime(now)
 
-	if current != state.IDLE {
-		return
-	}
-	if !s.cfg.IsWorkTime(now) {
-		return
-	}
+	// 每个群聊的触发与冷却相互独立，逐个判定
+	for _, chatID := range s.chats() {
+		machine := s.machineFor(chatID)
 
-	// 在工作时间内，按概率触发
-	// 每 5 分钟检查一次，若工作 9 小时，则约 108 次检查
-	// 设置每次检查触发概率为 5%，期望每个工作日触发约 5 次
-	// 如需更低频，可调整此概率
-	if s.randIntn(100) < 5 || s.shouldForceTrigger(now) {
-		s.onTrigger()
+		// 先检查冷却是否到期，即使不在工作时间也复位
+		machine.ResetCooldown()
+
+		if !workTime {
+			continue
+		}
+		if machine.Current() != state.IDLE {
+			continue
+		}
+
+		// 在工作时间内，按概率触发
+		// 每 5 分钟检查一次，若工作 9 小时，则每个群聊约有 108 次检查
+		// 设置每次检查触发概率为 5%，期望每个群聊每个工作日触发约 5 次
+		// 如需更低频，可调整此概率
+		if s.randIntn(100) < 5 || s.shouldForceTrigger(chatID, now) {
+			s.onTrigger(chatID)
+		}
 	}
 }
 
 // shouldForceTrigger 实现“每个群聊每天至少触发一次”的保底：
 // 进入工作结束前 FORCE_TRIGGER_WINDOW_MINUTES 分钟的窗口后，
-// 若仍有目标群聊当天未触发，则不再依赖概率，直接触发
-func (s *Scheduler) shouldForceTrigger(now time.Time) bool {
-	if s.pendingToday == nil || !s.pendingToday() {
+// 若该群聊当天未触发，则不再依赖概率，直接触发
+func (s *Scheduler) shouldForceTrigger(chatID string, now time.Time) bool {
+	if s.pendingToday == nil || !s.pendingToday(chatID) {
 		return false
 	}
 	window := time.Duration(s.cfg.ForceTriggerWindowMinutes) * time.Minute
@@ -131,8 +137,8 @@ func (s *Scheduler) shouldForceTrigger(now time.Time) bool {
 	return !now.Add(window).Before(end)
 }
 
-// SetPendingToday 注入“是否存在当天未触发的群聊”的判定函数
-func (s *Scheduler) SetPendingToday(fn func() bool) {
+// SetPendingToday 注入“指定群聊当天是否尚未触发”的判定函数
+func (s *Scheduler) SetPendingToday(fn func(chatID string) bool) {
 	s.pendingToday = fn
 }
 
