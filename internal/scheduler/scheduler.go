@@ -66,6 +66,11 @@ func (s *Scheduler) Start(ctx context.Context) {
 	ticker := time.NewTicker(s.checkEvery)
 	defer ticker.Stop()
 
+	// 启动即触发一轮：无视工作时间与随机概率，对所有 IDLE 群聊直接触发
+	if s.cfg.TriggerOnStart {
+		s.triggerAll()
+	}
+
 	// 启动时立即检查一次
 	s.tick()
 
@@ -117,6 +122,20 @@ func (s *Scheduler) tick() {
 		if s.randIntn(100) < 5 || s.shouldForceTrigger(chatID, now) {
 			s.onTrigger(chatID)
 		}
+	}
+}
+
+// triggerAll 对所有目标群聊直接触发一轮，无视工作时间与随机概率；
+// 与常规 tick 一样要求群聊处于 IDLE：非 IDLE 的群聊跳过
+// （例如同一进程内 Stop 后重新 Start 时仍处于冷却的群）
+func (s *Scheduler) triggerAll() {
+	for _, chatID := range s.chats() {
+		machine := s.machineFor(chatID)
+		machine.ResetCooldown()
+		if machine.Current() != state.IDLE {
+			continue
+		}
+		s.onTrigger(chatID)
 	}
 }
 

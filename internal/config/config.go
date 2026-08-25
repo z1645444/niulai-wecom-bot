@@ -59,6 +59,10 @@ type Config struct {
 	// 若仍有群聊当天未触发，则强制触发一次
 	ForceTriggerWindowMinutes int
 
+	// TriggerOnStart 为 true 时，服务启动即对所有目标群聊触发一轮喊话，
+	// 无视工作时间与随机概率；默认 false，启动仅做一次常规调度检查
+	TriggerOnStart bool
+
 	// FinishReplyType 是停止指令生效后的回复类型：text 或 image
 	FinishReplyType string
 	// FinishReplyText 是文本回复内容，默认 🐮
@@ -165,6 +169,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid FORCE_TRIGGER_WINDOW_MINUTES: %w", err)
 	}
 
+	triggerOnStart, err := parseBool(os.Getenv("TRIGGER_ON_START"), false)
+	if err != nil {
+		return nil, fmt.Errorf("invalid TRIGGER_ON_START: %w", err)
+	}
+
 	// 停止关键词按与消息内容相同的规则压缩空白，
 	// 避免关键词本身含空白时永远无法命中压缩后的内容
 	stopKeyword := normalizeSpaces(os.Getenv("STOP_KEYWORD"))
@@ -232,6 +241,7 @@ func Load() (*Config, error) {
 		ScreamVoiceFile:           voiceFile,
 		StopKeyword:               stopKeyword,
 		ForceTriggerWindowMinutes: forceWindow,
+		TriggerOnStart:            triggerOnStart,
 		FinishReplyType:           replyType,
 		FinishReplyText:           replyText,
 		FinishReplyImageURL:       replyImageURL,
@@ -293,6 +303,17 @@ func parseInt(value string, defaultValue int) (int, error) {
 		return 0, fmt.Errorf("must be positive, got %d", n)
 	}
 	return n, nil
+}
+
+func parseBool(value string, defaultValue bool) (bool, error) {
+	if strings.TrimSpace(value) == "" {
+		return defaultValue, nil
+	}
+	b, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
+		return false, fmt.Errorf("invalid boolean %q", value)
+	}
+	return b, nil
 }
 
 // IsWorkTime 判断当前时间是否处于工作时间

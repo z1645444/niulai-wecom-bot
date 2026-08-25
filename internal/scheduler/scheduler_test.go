@@ -348,6 +348,69 @@ func TestSchedulerNoForceTriggerOutsideWindow(t *testing.T) {
 	}
 }
 
+func TestSchedulerTriggerOnStartIgnoresWorkTime(t *testing.T) {
+	// 无工作日：常规 tick 永不触发，若仍收到触发事件则只能来自启动触发
+	triggered := make(chan string, 2)
+	cfg := &config.Config{
+		WorkStartTime:  mustParseTime("09:00"),
+		WorkEndTime:    mustParseTime("18:00"),
+		WorkDays:       map[int]struct{}{},
+		TriggerOnStart: true,
+	}
+
+	machines := map[string]*state.Machine{
+		"chat-1": state.NewMachine(),
+		"chat-2": state.NewMachine(),
+	}
+	s := New(cfg,
+		func() []string { return []string{"chat-1", "chat-2"} },
+		func(chatID string) *state.Machine { return machines[chatID] },
+		func(chatID string) { triggered <- chatID },
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Start(ctx)
+
+	// 启动触发先于首次 tick 同步执行，事件到达即返回；1s 超时仅作失败兜底
+	var got []string
+	for len(got) < 2 {
+		select {
+		case chatID := <-triggered:
+			got = append(got, chatID)
+		case <-time.After(time.Second):
+			t.Fatalf("expected both chats triggered on start, got %v", got)
+		}
+	}
+}
+
+func TestSchedulerTriggerOnStartSkipsScreamingChats(t *testing.T) {
+	var triggered []string
+	cfg := &config.Config{TriggerOnStart: true}
+
+	// chat-1 已在 SCREAMING，chat-2 处于 IDLE：启动触发只应作用于 chat-2
+	screaming := state.NewMachine()
+	if !screaming.StartScreaming() {
+		t.Fatal("failed to start screaming")
+	}
+	machines := map[string]*state.Machine{
+		"chat-1": screaming,
+		"chat-2": state.NewMachine(),
+	}
+
+	s := New(cfg,
+		func() []string { return []string{"chat-1", "chat-2"} },
+		func(chatID string) *state.Machine { return machines[chatID] },
+		func(chatID string) { triggered = append(triggered, chatID) },
+	)
+
+	s.triggerAll()
+
+	if len(triggered) != 1 || triggered[0] != "chat-2" {
+		t.Fatalf("expected only chat-2 triggered on start, got %v", triggered)
+	}
+}
+
 func mustParseTime(s string) time.Time {
 	t, _ := time.Parse("15:04", s)
 	return t

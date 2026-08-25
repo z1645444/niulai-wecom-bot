@@ -268,6 +268,7 @@ func (nl *NiuLai) Start(ctx context.Context) {
 		"max_interval", nl.cfg.MaxIntervalSeconds,
 		"cooldown_minutes", nl.cfg.CooldownMinutes,
 		"max_send_failures", nl.cfg.MaxSendFailures,
+		"trigger_on_start", nl.cfg.TriggerOnStart,
 	)
 }
 

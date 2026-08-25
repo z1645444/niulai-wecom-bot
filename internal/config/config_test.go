@@ -299,6 +299,62 @@ func TestLoadScreamVoiceFileOversize(t *testing.T) {
 	}
 }
 
+func TestLoadTriggerOnStart(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.TriggerOnStart {
+		t.Fatal("TriggerOnStart should default to false")
+	}
+
+	t.Setenv("TRIGGER_ON_START", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.TriggerOnStart {
+		t.Fatal("TriggerOnStart should be true")
+	}
+
+	t.Setenv("TRIGGER_ON_START", "yes")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for invalid TRIGGER_ON_START")
+	}
+}
+
+func TestParseBool(t *testing.T) {
+	cases := []struct {
+		value    string
+		defaultV bool
+		want     bool
+		wantErr  bool
+	}{
+		{"", false, false, false},
+		{"", true, true, false},
+		{"true", false, true, false},
+		{"1", false, true, false},
+		{"false", true, false, false},
+		{"0", true, false, false},
+		{" true ", false, true, false},
+		{"yes", false, false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.value, func(t *testing.T) {
+			got, err := parseBool(c.value, c.defaultV)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("parseBool(%q) err = %v, wantErr %v", c.value, err, c.wantErr)
+			}
+			if got != c.want {
+				t.Fatalf("parseBool(%q) = %v, want %v", c.value, got, c.want)
+			}
+		})
+	}
+}
+
 func mustParse(s string) time.Time {
 	t, _ := time.Parse("15:04", s)
 	return t

@@ -78,3 +78,4 @@ make build-all
 - `WECOM_BOT_ID` 和 `WECOM_BOT_SECRET` 请通过环境变量注入，不要提交到代码仓库
 - 服务以单进程方式运行，重启后状态重置为 `IDLE`
 - `TARGET_CHAT_ID` 支持逗号分隔的多个会话 ID；留空时从回调中自动发现并增量加入，列表变化会同步回写 `.env`（文件不存在时跳过）
+- 设置 `TRIGGER_ON_START=true` 后，服务启动即对所有目标群聊触发一轮喊话（无视工作时间与随机概率），默认关闭
