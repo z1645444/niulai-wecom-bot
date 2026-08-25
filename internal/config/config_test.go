@@ -2,8 +2,11 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"niulai-wecom-bot/internal/wecom"
 )
 
 func TestLoadRequired(t *testing.T) {
@@ -225,6 +228,74 @@ func TestLoadStopKeywordBlank(t *testing.T) {
 	}
 	if cfg.StopKeyword != DefaultStopKeyword {
 		t.Fatalf("StopKeyword = %q, want default %q", cfg.StopKeyword, DefaultStopKeyword)
+	}
+}
+
+func TestLoadScreamVoiceFile(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ScreamVoiceFile != "" {
+		t.Fatalf("ScreamVoiceFile = %q, want empty by default", cfg.ScreamVoiceFile)
+	}
+
+	t.Setenv("SCREAM_VOICE_FILE", "/tmp/scream.amr")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ScreamVoiceFile != "/tmp/scream.amr" {
+		t.Fatalf("ScreamVoiceFile = %q, want %q", cfg.ScreamVoiceFile, "/tmp/scream.amr")
+	}
+}
+
+func TestLoadScreamVoiceFileRequiresAbsolutePath(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+	t.Setenv("SCREAM_VOICE_FILE", "voice/scream.amr")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for relative SCREAM_VOICE_FILE")
+	}
+}
+
+func TestLoadScreamVoiceFileRequiresAmr(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+	t.Setenv("SCREAM_VOICE_FILE", "/tmp/scream.mp3")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for non-amr SCREAM_VOICE_FILE")
+	}
+
+	// 大写后缀同样接受
+	t.Setenv("SCREAM_VOICE_FILE", "/tmp/scream.AMR")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
+// 文件存在且超过语音素材上限时启动报错；文件不存在时保留运行时回退行为
+func TestLoadScreamVoiceFileOversize(t *testing.T) {
+	t.Setenv("WECOM_BOT_ID", "test-bot")
+	t.Setenv("WECOM_BOT_SECRET", "test-secret")
+
+	oversize := filepath.Join(t.TempDir(), "scream.amr")
+	if err := os.WriteFile(oversize, make([]byte, wecom.MaxVoiceMediaSize+1), 0o600); err != nil {
+		t.Fatalf("write oversize voice file: %v", err)
+	}
+	t.Setenv("SCREAM_VOICE_FILE", oversize)
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for oversize SCREAM_VOICE_FILE")
+	}
+
+	t.Setenv("SCREAM_VOICE_FILE", filepath.Join(t.TempDir(), "missing.amr"))
+	if _, err := Load(); err != nil {
+		t.Fatalf("missing voice file must not fail Load() (runtime fallback), got %v", err)
 	}
 }
 

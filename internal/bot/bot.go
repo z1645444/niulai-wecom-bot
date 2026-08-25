@@ -29,7 +29,8 @@ const zeroWidthSpace = '\u200B'
 
 // Sender 是 bot 对外发送消息所需的最小接口，便于测试与解耦
 type Sender interface {
-	SendMarkdown(chatID string, chatType uint32, content string) error
+	SendMarkdown(ctx context.Context, chatID string, chatType uint32, content string) error
+	SendVoice(ctx context.Context, chatID string, chatType uint32, mediaID string) error
 	RespondMarkdown(reqID, content string) error
 	RespondImage(reqID, mediaID string) error
 	UploadMedia(ctx context.Context, mediaType, filename string, data []byte) (string, error)
@@ -61,9 +62,17 @@ type NiuLai struct {
 	triggeredMu sync.Mutex
 	triggered   map[string]string
 
-	// mediaCache 缓存图片回复地址到 media_id 的映射，避免每次回复都重新上传素材
+	// mediaCache 缓存素材地址（图片地址、语音文件路径）到已上传素材的映射，
+	// 避免每次发送都重新上传素材
 	mediaMu    sync.Mutex
-	mediaCache map[string]string
+	mediaCache map[string]mediaEntry
+
+	// voiceFailures 记录语音喊话的连续失败次数；达到 maxVoiceFailures 后在
+	// voiceDisabledUntil 之前暂停语音尝试（期间直接回退文字），避免服务端
+	// 持续拒绝语音时每个喊话周期都重新上传素材
+	voiceMu            sync.Mutex
+	voiceFailures      int
+	voiceDisabledUntil time.Time
 
 	// persistTargets 在目标群聊列表变化（自动发现、失败移除）后持久化最新的
 	// TARGET_CHAT_ID 值（如回写 .env）；为 nil 时不持久化。须在 Start 前完成设置
@@ -79,6 +88,92 @@ type NiuLai struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
+}
+
+// mediaIDRefreshAfter 是缓存 media_id 的刷新阈值：企业微信临时素材有效期 3 天，
+// 超过该时长即视为过期并重新上传，留出充足余量避免用到临期 media_id
+const mediaIDRefreshAfter = 48 * time.Hour
+
+const (
+	// maxVoiceFailures 是语音喊话连续失败的容忍次数，达到后进入暂停期
+	maxVoiceFailures = 3
+	// voiceDisableDuration 是语音连续失败后的暂停时长，到期自动重试
+	voiceDisableDuration = time.Hour
+)
+
+// mediaEntry 是已上传素材的缓存条目
+type mediaEntry struct {
+	mediaID    string
+	uploadedAt time.Time
+	// size 与 modTime 仅对本地文件素材（语音）记录，用于检测同路径文件被替换；
+	// 非文件来源（图片 URL）保持零值
+	size    int64
+	modTime time.Time
+}
+
+// cachedMediaID 返回缓存且未过期的 mediaID；缺失、超过刷新阈值，
+// 或文件信息（info 非 nil 时）与缓存不一致（同路径文件被替换）时返回 false
+func (nl *NiuLai) cachedMediaID(addr string, info os.FileInfo) (string, bool) {
+	nl.mediaMu.Lock()
+	defer nl.mediaMu.Unlock()
+	entry, ok := nl.mediaCache[addr]
+	if !ok || nl.now().Sub(entry.uploadedAt) >= mediaIDRefreshAfter {
+		return "", false
+	}
+	if info != nil && (entry.size != info.Size() || !entry.modTime.Equal(info.ModTime())) {
+		return "", false
+	}
+	return entry.mediaID, true
+}
+
+// storeMediaID 缓存上传成功的 mediaID，并记录上传时间用于过期判断；
+// info 非 nil 时记录文件信息，用于检测同路径文件被替换
+func (nl *NiuLai) storeMediaID(addr, mediaID string, info os.FileInfo) {
+	nl.mediaMu.Lock()
+	defer nl.mediaMu.Unlock()
+	entry := mediaEntry{mediaID: mediaID, uploadedAt: nl.now()}
+	if info != nil {
+		entry.size = info.Size()
+		entry.modTime = info.ModTime()
+	}
+	nl.mediaCache[addr] = entry
+}
+
+// evictMediaID 清除缓存的 mediaID，发送失败后下次重新上传
+func (nl *NiuLai) evictMediaID(addr string) {
+	nl.mediaMu.Lock()
+	defer nl.mediaMu.Unlock()
+	delete(nl.mediaCache, addr)
+}
+
+// voiceDisabled 报告语音喊话是否处于连续失败后的暂停期
+func (nl *NiuLai) voiceDisabled() bool {
+	nl.voiceMu.Lock()
+	defer nl.voiceMu.Unlock()
+	return nl.now().Before(nl.voiceDisabledUntil)
+}
+
+// recordVoiceFailure 累计语音喊话连续失败次数，达到阈值后暂停语音一段时间
+func (nl *NiuLai) recordVoiceFailure() {
+	nl.voiceMu.Lock()
+	defer nl.voiceMu.Unlock()
+	nl.voiceFailures++
+	if nl.voiceFailures < maxVoiceFailures {
+		return
+	}
+	nl.voiceFailures = 0
+	nl.voiceDisabledUntil = nl.now().Add(voiceDisableDuration)
+	nl.logger.Warn("voice scream paused after consecutive failures, falling back to text",
+		"failures", maxVoiceFailures,
+		"resume_at", nl.voiceDisabledUntil.Format(time.RFC3339),
+	)
+}
+
+// resetVoiceFailures 在语音喊话成功后清零连续失败计数
+func (nl *NiuLai) resetVoiceFailures() {
+	nl.voiceMu.Lock()
+	defer nl.voiceMu.Unlock()
+	nl.voiceFailures = 0
 }
 
 // chatSession 是单个群聊的独立会话：状态机与 SCREAMING 上下文均按群隔离
@@ -130,7 +225,7 @@ func New(cfg *config.Config, client Sender, logger *slog.Logger) *NiuLai {
 		sessions:   make(map[string]*chatSession),
 		failures:   make(map[string]int),
 		triggered:  make(map[string]string),
-		mediaCache: make(map[string]string),
+		mediaCache: make(map[string]mediaEntry),
 		sleep:      ctxSleep,
 		now:        time.Now,
 	}
@@ -303,26 +398,20 @@ func (nl *NiuLai) sendImageReply(reqID string) error {
 		return err
 	}
 	if err := nl.client.RespondImage(reqID, mediaID); err != nil {
-		nl.mediaMu.Lock()
-		delete(nl.mediaCache, nl.cfg.FinishReplyImageURL)
-		nl.mediaMu.Unlock()
+		nl.evictMediaID(nl.cfg.FinishReplyImageURL)
 		return err
 	}
 	return nil
 }
 
-// finishImageMediaID 返回图片回复的 media_id，进程内按地址缓存；
-// media_id 有效期 3 天，远长于进程运行周期内的回复间隔，重启后自动重新上传
+// finishImageMediaID 返回图片回复的 media_id，进程内按地址缓存，到期自动重新上传
 func (nl *NiuLai) finishImageMediaID() (string, error) {
 	addr := nl.cfg.FinishReplyImageURL
 	if addr == "" {
 		return "", fmt.Errorf("FINISH_REPLY_IMAGE_URL is empty")
 	}
 
-	nl.mediaMu.Lock()
-	mediaID, ok := nl.mediaCache[addr]
-	nl.mediaMu.Unlock()
-	if ok {
+	if mediaID, ok := nl.cachedMediaID(addr, nil); ok {
 		return mediaID, nil
 	}
 
@@ -331,14 +420,12 @@ func (nl *NiuLai) finishImageMediaID() (string, error) {
 		return "", err
 	}
 
-	mediaID, err = nl.client.UploadMedia(nl.ctx, "image", filename, data)
+	mediaID, err := nl.client.UploadMedia(nl.ctx, "image", filename, data)
 	if err != nil {
 		return "", fmt.Errorf("upload finish reply image: %w", err)
 	}
 
-	nl.mediaMu.Lock()
-	nl.mediaCache[addr] = mediaID
-	nl.mediaMu.Unlock()
+	nl.storeMediaID(addr, mediaID, nil)
 	nl.logger.Info("finish reply image uploaded", "addr", addr, "filename", filename)
 	return mediaID, nil
 }
@@ -582,9 +669,28 @@ func (nl *NiuLai) screamLoop(ctx context.Context, session *chatSession, chatID s
 	}
 }
 
-// sendScream 向指定群聊发送一次喊话内容；连续失败过多的群聊会被移出目标列表
+// sendScream 向指定群聊发送一次喊话内容；连续失败过多的群聊会被移出目标列表。
+// 配置了语音文件时优先发送语音；语音不可用（文件缺失、读取/上传/发送失败，
+// 或处于连续失败暂停期）时回退为文字
 func (nl *NiuLai) sendScream(chatID string) {
-	if err := nl.client.SendMarkdown(chatID, wecom.ChatTypeGroup, nl.cfg.ScreamContent); err != nil {
+	if nl.cfg.ScreamVoiceFile != "" && !nl.voiceDisabled() {
+		if err := nl.sendVoiceScream(chatID); err != nil {
+			nl.recordVoiceFailure()
+			nl.logger.Warn("voice scream failed, fallback to text",
+				"chatid", chatID,
+				"file", nl.cfg.ScreamVoiceFile,
+				"err", err,
+			)
+		} else {
+			nl.resetVoiceFailures()
+			nl.resetSendFailures(chatID)
+			nl.markTriggered(chatID)
+			nl.logger.Info("voice scream sent", "chatid", chatID, "file", nl.cfg.ScreamVoiceFile)
+			return
+		}
+	}
+
+	if err := nl.client.SendMarkdown(nl.ctx, chatID, wecom.ChatTypeGroup, nl.cfg.ScreamContent); err != nil {
 		failures := nl.recordSendFailure(chatID)
 		nl.logger.Warn("failed to send scream message",
 			"chatid", chatID,
@@ -597,6 +703,56 @@ func (nl *NiuLai) sendScream(chatID string) {
 	nl.resetSendFailures(chatID)
 	nl.markTriggered(chatID)
 	nl.logger.Info("scream sent", "chatid", chatID, "content", nl.cfg.ScreamContent)
+}
+
+// sendVoiceScream 上传语音素材并向指定群聊发送语音消息；
+// 发送失败时清除缓存的 media_id 以便下次重新上传
+func (nl *NiuLai) sendVoiceScream(chatID string) error {
+	mediaID, err := nl.screamVoiceMediaID()
+	if err != nil {
+		return err
+	}
+	if err := nl.client.SendVoice(nl.ctx, chatID, wecom.ChatTypeGroup, mediaID); err != nil {
+		nl.evictMediaID(nl.cfg.ScreamVoiceFile)
+		return err
+	}
+	return nil
+}
+
+// screamVoiceMediaID 返回喊话语音的 media_id，进程内按文件路径缓存，
+// 超过刷新阈值或同路径文件被替换后自动重新上传。
+// 每次发送前检测文件是否存在，文件缺失时由调用方回退为文字
+func (nl *NiuLai) screamVoiceMediaID() (string, error) {
+	addr := nl.cfg.ScreamVoiceFile
+	if addr == "" {
+		return "", fmt.Errorf("SCREAM_VOICE_FILE is empty")
+	}
+	info, err := os.Stat(addr)
+	if err != nil {
+		return "", fmt.Errorf("voice file %q: %w", addr, err)
+	}
+	// 企业微信语音素材上限 2MB：超限必然上传失败，在发送前直接交由调用方回退文字
+	if info.Size() > wecom.MaxVoiceMediaSize {
+		return "", fmt.Errorf("voice file %q too large: %d bytes, max %d", addr, info.Size(), wecom.MaxVoiceMediaSize)
+	}
+
+	if mediaID, ok := nl.cachedMediaID(addr, info); ok {
+		return mediaID, nil
+	}
+
+	data, err := os.ReadFile(addr)
+	if err != nil {
+		return "", fmt.Errorf("read voice file %q: %w", addr, err)
+	}
+
+	mediaID, err := nl.client.UploadMedia(nl.ctx, "voice", filepath.Base(addr), data)
+	if err != nil {
+		return "", fmt.Errorf("upload scream voice: %w", err)
+	}
+
+	nl.storeMediaID(addr, mediaID, info)
+	nl.logger.Info("scream voice uploaded", "file", addr)
+	return mediaID, nil
 }
 
 // markTriggered 记录该群聊今天已经成功触发过事件

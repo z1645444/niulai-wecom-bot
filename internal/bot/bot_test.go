@@ -25,10 +25,12 @@ import (
 type fakeSender struct {
 	mu               sync.Mutex
 	sends            []sendCall
+	sendVoices       []sendVoiceCall
 	responds         []respondCall
 	respondImages    []respondImageCall
 	uploads          []uploadCall
 	failSend         bool
+	failSendVoice    bool
 	failUpload       bool
 	failRespondImage bool
 }
@@ -37,6 +39,12 @@ type sendCall struct {
 	chatID   string
 	chatType uint32
 	content  string
+}
+
+type sendVoiceCall struct {
+	chatID   string
+	chatType uint32
+	mediaID  string
 }
 
 type respondCall struct {
@@ -55,13 +63,23 @@ type uploadCall struct {
 	size      int
 }
 
-func (f *fakeSender) SendMarkdown(chatID string, chatType uint32, content string) error {
+func (f *fakeSender) SendMarkdown(_ context.Context, chatID string, chatType uint32, content string) error {
 	if f.failSend {
 		return errTest()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sends = append(f.sends, sendCall{chatID: chatID, chatType: chatType, content: content})
+	return nil
+}
+
+func (f *fakeSender) SendVoice(_ context.Context, chatID string, chatType uint32, mediaID string) error {
+	if f.failSendVoice {
+		return errTest()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sendVoices = append(f.sendVoices, sendVoiceCall{chatID: chatID, chatType: chatType, mediaID: mediaID})
 	return nil
 }
 
@@ -1288,6 +1306,337 @@ func TestFailedSendDoesNotMarkTriggered(t *testing.T) {
 	nl.sendScream("chat-1")
 	if !nl.hasPendingChat("chat-1") {
 		t.Fatal("expected pending when send fails")
+	}
+}
+
+// writeVoiceFile 在临时目录写入语音文件并返回其绝对路径
+func writeVoiceFile(t *testing.T) string {
+	t.Helper()
+	addr := filepath.Join(t.TempDir(), "scream.amr")
+	if err := os.WriteFile(addr, []byte("#!AMR\n voice-data"), 0o600); err != nil {
+		t.Fatalf("write voice file: %v", err)
+	}
+	return addr
+}
+
+func TestScreamSendsVoiceWhenConfigured(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	addr := writeVoiceFile(t)
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3, ScreamVoiceFile: addr}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.sendVoices) != 1 {
+		t.Fatalf("expected 1 voice send, got %d", len(fake.sendVoices))
+	}
+	voice := fake.sendVoices[0]
+	if voice.chatID != "chat-1" || voice.chatType != wecom.ChatTypeGroup || voice.mediaID != "media-id-1" {
+		t.Fatalf("unexpected voice send: %+v", voice)
+	}
+	if len(fake.uploads) != 1 || fake.uploads[0].mediaType != "voice" || fake.uploads[0].filename != "scream.amr" {
+		t.Fatalf("unexpected uploads: %+v", fake.uploads)
+	}
+	if len(fake.sends) != 0 {
+		t.Fatalf("expected no text fallback, got %d sends", len(fake.sends))
+	}
+	if nl.hasPendingChat("chat-1") {
+		t.Fatal("expected voice scream to mark the chat triggered")
+	}
+}
+
+func TestScreamVoiceCachesMediaID(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	addr := writeVoiceFile(t)
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3, ScreamVoiceFile: addr}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	nl.sendScream("chat-1")
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.sendVoices) != 2 {
+		t.Fatalf("expected 2 voice sends, got %d", len(fake.sendVoices))
+	}
+	if len(fake.uploads) != 1 {
+		t.Fatalf("expected voice file uploaded once, got %d", len(fake.uploads))
+	}
+}
+
+// TestScreamVoiceReuploadsAfterRefreshThreshold 验证缓存的 media_id 超过刷新阈值后
+// 自动重新上传，避免用到已过 3 天有效期的 media_id
+func TestScreamVoiceReuploadsAfterRefreshThreshold(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	addr := writeVoiceFile(t)
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3, ScreamVoiceFile: addr}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	current := time.Date(2026, 8, 25, 10, 0, 0, 0, time.Local)
+	nl.now = func() time.Time { return current }
+
+	nl.sendScream("chat-1")
+
+	// 阈值之前：命中缓存，不重新上传
+	current = current.Add(mediaIDRefreshAfter - time.Hour)
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	if len(fake.uploads) != 1 {
+		t.Fatalf("expected no re-upload before threshold, got %d", len(fake.uploads))
+	}
+	fake.mu.Unlock()
+
+	// 超过阈值：缓存视为过期，重新上传
+	current = current.Add(2 * time.Hour)
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.uploads) != 2 {
+		t.Fatalf("expected re-upload after threshold, got %d uploads", len(fake.uploads))
+	}
+	if len(fake.sendVoices) != 3 {
+		t.Fatalf("expected 3 voice sends, got %d", len(fake.sendVoices))
+	}
+}
+
+// TestFinishReplyImageReuploadsAfterRefreshThreshold 验证图片回复缓存的 media_id
+// 超过刷新阈值后同样重新上传
+func TestFinishReplyImageReuploadsAfterRefreshThreshold(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+
+	imageData := pngBytes(1024)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(imageData)
+	}))
+	defer server.Close()
+
+	nl := New(&config.Config{
+		CooldownMinutes:     1,
+		FinishReplyType:     config.ReplyTypeImage,
+		FinishReplyImageURL: server.URL + "/cow.png",
+	}, fake, logger)
+	nl.SetClient(fake)
+
+	current := time.Date(2026, 8, 25, 10, 0, 0, 0, time.Local)
+	nl.now = func() time.Time { return current }
+
+	nl.sendFinishReply("req-1")
+
+	current = current.Add(mediaIDRefreshAfter + time.Hour)
+	nl.sendFinishReply("req-2")
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.uploads) != 2 {
+		t.Fatalf("expected re-upload after threshold, got %d uploads", len(fake.uploads))
+	}
+	if len(fake.respondImages) != 2 {
+		t.Fatalf("expected 2 image replies, got %d", len(fake.respondImages))
+	}
+}
+
+func TestScreamVoiceMissingFileFallsBackToText(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	missing := filepath.Join(t.TempDir(), "missing.amr")
+	nl := New(&config.Config{
+		CooldownMinutes: 1,
+		MaxSendFailures: 3,
+		ScreamContent:   "妈妈",
+		ScreamVoiceFile: missing,
+	}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.sendVoices) != 0 || len(fake.uploads) != 0 {
+		t.Fatalf("expected no voice send or upload, got voices=%d uploads=%d", len(fake.sendVoices), len(fake.uploads))
+	}
+	if len(fake.sends) != 1 || fake.sends[0].content != "妈妈" {
+		t.Fatalf("expected text fallback with scream content, got %+v", fake.sends)
+	}
+	if nl.hasPendingChat("chat-1") {
+		t.Fatal("expected text fallback to mark the chat triggered")
+	}
+}
+
+func TestScreamVoiceUploadFailureFallsBackToText(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{failUpload: true}
+	addr := writeVoiceFile(t)
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3, ScreamVoiceFile: addr}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.sendVoices) != 0 {
+		t.Fatalf("expected no voice send, got %d", len(fake.sendVoices))
+	}
+	if len(fake.sends) != 1 {
+		t.Fatalf("expected text fallback, got %d sends", len(fake.sends))
+	}
+	if got := nl.getSendFailures("chat-1"); got != 0 {
+		t.Fatalf("expected no send failure recorded after successful fallback, got %d", got)
+	}
+}
+
+// TestScreamVoiceOversizeFallsBackToText 验证语音文件超过企业微信 2MB 上限时
+// 不发起上传，直接回退为文字喊话
+func TestScreamVoiceOversizeFallsBackToText(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	addr := filepath.Join(t.TempDir(), "scream.amr")
+	if err := os.WriteFile(addr, make([]byte, wecom.MaxVoiceMediaSize+1), 0o600); err != nil {
+		t.Fatalf("write oversize voice file: %v", err)
+	}
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3, ScreamVoiceFile: addr}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.uploads) != 0 || len(fake.sendVoices) != 0 {
+		t.Fatalf("expected no upload or voice send, got uploads=%d voices=%d", len(fake.uploads), len(fake.sendVoices))
+	}
+	if len(fake.sends) != 1 {
+		t.Fatalf("expected text fallback, got %d sends", len(fake.sends))
+	}
+}
+
+func TestScreamVoiceSendFailureFallsBackToTextAndClearsCache(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	addr := writeVoiceFile(t)
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3, ScreamVoiceFile: addr}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	if len(fake.uploads) != 1 {
+		t.Fatalf("expected initial upload, got %d", len(fake.uploads))
+	}
+	fake.failSendVoice = true
+	fake.mu.Unlock()
+
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	if len(fake.sends) != 1 {
+		t.Fatalf("expected text fallback after voice send failure, got %d sends", len(fake.sends))
+	}
+	// 缓存的 media_id 已清除，恢复后重新上传
+	fake.failSendVoice = false
+	fake.mu.Unlock()
+
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.uploads) != 2 {
+		t.Fatalf("expected re-upload after cache cleared, got %d uploads", len(fake.uploads))
+	}
+	if len(fake.sendVoices) != 2 {
+		t.Fatalf("expected 2 voice sends, got %d", len(fake.sendVoices))
+	}
+}
+
+// TestScreamVoicePausedAfterConsecutiveFailures 验证语音连续失败达到阈值后进入暂停期：
+// 暂停期内不再尝试语音（不重新上传），直接回退文字；暂停期结束后自动重试
+func TestScreamVoicePausedAfterConsecutiveFailures(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{failSendVoice: true}
+	addr := writeVoiceFile(t)
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3, ScreamVoiceFile: addr}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	current := time.Date(2026, 8, 25, 10, 0, 0, 0, time.Local)
+	nl.now = func() time.Time { return current }
+
+	// 连续失败达到阈值：每次发送失败都会清除缓存，因此每次都重新上传
+	for i := 0; i < maxVoiceFailures; i++ {
+		nl.sendScream("chat-1")
+	}
+	fake.mu.Lock()
+	if len(fake.uploads) != maxVoiceFailures {
+		t.Fatalf("expected %d uploads before pause, got %d", maxVoiceFailures, len(fake.uploads))
+	}
+	sendsBeforePause := len(fake.sends)
+	fake.mu.Unlock()
+
+	// 暂停期内：直接回退文字，不再上传
+	nl.sendScream("chat-1")
+	fake.mu.Lock()
+	if len(fake.uploads) != maxVoiceFailures {
+		t.Fatalf("expected no upload while paused, got %d", len(fake.uploads))
+	}
+	if len(fake.sends) != sendsBeforePause+1 {
+		t.Fatalf("expected text fallback while paused, got %d sends", len(fake.sends))
+	}
+	fake.mu.Unlock()
+
+	// 暂停期结束且语音恢复可用：自动重试语音
+	current = current.Add(voiceDisableDuration + time.Minute)
+	fake.mu.Lock()
+	fake.failSendVoice = false
+	fake.mu.Unlock()
+
+	nl.sendScream("chat-1")
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.uploads) != maxVoiceFailures+1 {
+		t.Fatalf("expected re-upload after pause expired, got %d uploads", len(fake.uploads))
+	}
+	if len(fake.sendVoices) != 1 {
+		t.Fatalf("expected voice retry after pause expired, got %d voice sends", len(fake.sendVoices))
+	}
+}
+
+// TestScreamVoiceReuploadsWhenFileChanged 验证同路径语音文件被替换后缓存失效并重新上传
+func TestScreamVoiceReuploadsWhenFileChanged(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{}
+	addr := writeVoiceFile(t)
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 3, ScreamVoiceFile: addr}, fake, logger)
+	nl.SetClient(fake)
+	nl.captureChatID("group", "chat-1")
+
+	nl.sendScream("chat-1")
+
+	// 同路径替换为不同内容的文件：大小变化确保绕过文件系统时间戳精度问题
+	if err := os.WriteFile(addr, []byte("#!AMR\n voice-data-v2-with-different-size"), 0o600); err != nil {
+		t.Fatalf("rewrite voice file: %v", err)
+	}
+	nl.sendScream("chat-1")
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.uploads) != 2 {
+		t.Fatalf("expected re-upload after file change, got %d uploads", len(fake.uploads))
+	}
+	if len(fake.sendVoices) != 2 {
+		t.Fatalf("expected 2 voice sends, got %d", len(fake.sendVoices))
 	}
 }
 

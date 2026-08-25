@@ -302,7 +302,7 @@ func TestClientSendMarkdown(t *testing.T) {
 		t.Fatal("client did not connect in time")
 	}
 
-	if err := client.SendMarkdown("chat-1", ChatTypeGroup, "妈妈"); err != nil {
+	if err := client.SendMarkdown(context.Background(), "chat-1", ChatTypeGroup, "妈妈"); err != nil {
 		cancel()
 		runWG.Wait()
 		t.Fatalf("send markdown: %v", err)
@@ -328,6 +328,81 @@ func TestClientSendMarkdown(t *testing.T) {
 	}
 	if body.ChatID != "chat-1" || body.MsgType != "markdown" || body.Markdown.Content != "妈妈" {
 		t.Fatalf("unexpected body: %+v", body)
+	}
+}
+
+// TestClientSendVoiceServerError 验证服务端拒绝 aibot_send_msg（errcode 非 0）时
+// 错误能返回给调用方，以便上层回退为文字消息
+func TestClientSendVoiceServerError(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	connected := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		var authReq Frame
+		if err := conn.ReadJSON(&authReq); err != nil {
+			return
+		}
+		if err := conn.WriteJSON(Frame{Cmd: "aibot_subscribe", ErrCode: 0}); err != nil {
+			return
+		}
+		close(connected)
+
+		for {
+			var f Frame
+			if err := conn.ReadJSON(&f); err != nil {
+				return
+			}
+			if f.Cmd == "aibot_send_msg" {
+				_ = conn.WriteJSON(Frame{
+					Cmd:     f.Cmd,
+					Headers: Headers{ReqID: f.Headers.ReqID},
+					ErrCode: 60011,
+					ErrMsg:  "no privilege to send voice",
+				})
+			}
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
+	client := NewClient("bot-id", "secret", nil, logger).SetURL(wsTestURL(t, server))
+
+	var runWG sync.WaitGroup
+	runWG.Add(1)
+	go func() {
+		defer runWG.Done()
+		_ = client.Run(ctx)
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		cancel()
+		runWG.Wait()
+		t.Fatal("client did not connect in time")
+	}
+
+	err := client.SendVoice(context.Background(), "chat-1", ChatTypeGroup, "media-1")
+	cancel()
+	runWG.Wait()
+
+	if err == nil {
+		t.Fatal("expected error when server rejects voice message")
+	}
+	if !strings.Contains(err.Error(), "60011") {
+		t.Fatalf("expected errcode in error, got %v", err)
 	}
 }
 
@@ -621,6 +696,19 @@ func TestClientUploadMediaErrorResponse(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "60011") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestClientUploadMediaSizeLimits 验证客户端侧的素材大小守卫在发起网络请求前生效
+func TestClientUploadMediaSizeLimits(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
+	client := NewClient("bot-id", "secret", nil, logger)
+
+	if _, err := client.UploadMedia(context.Background(), "voice", "scream.amr", bytes.Repeat([]byte{0x01}, MaxVoiceMediaSize+1)); err == nil {
+		t.Fatal("expected error for oversize voice media")
+	}
+	if _, err := client.UploadMedia(context.Background(), "image", "cow.png", bytes.Repeat([]byte{0x01}, MaxImageMediaSize+1)); err == nil {
+		t.Fatal("expected error for oversize image media")
 	}
 }
 

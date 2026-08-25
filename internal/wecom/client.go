@@ -31,6 +31,8 @@ const (
 
 	// MaxImageMediaSize 是图片素材的大小上限（10MB）
 	MaxImageMediaSize = 10 * 1024 * 1024
+	// MaxVoiceMediaSize 是语音素材的大小上限（2MB，仅支持 amr 格式）
+	MaxVoiceMediaSize = 2 * 1024 * 1024
 )
 
 const (
@@ -66,11 +68,17 @@ type SendMsgBody struct {
 	ChatType uint32    `json:"chat_type,omitempty"`
 	MsgType  string    `json:"msgtype"`
 	Markdown *Markdown `json:"markdown,omitempty"`
+	Voice    *Voice    `json:"voice,omitempty"`
 }
 
 // Markdown 是 markdown 消息体
 type Markdown struct {
 	Content string `json:"content"`
+}
+
+// Voice 是 voice 消息体
+type Voice struct {
+	MediaID string `json:"media_id"`
 }
 
 // Image 是 image 消息体
@@ -376,6 +384,18 @@ func (c *Client) handleFrame(frame Frame) {
 		}
 	}
 
+	// 无等待者的响应帧（来自 enqueue 的异步请求，如 aibot_respond_msg）：
+	// 错误结果不应静默丢弃
+	if frame.ErrCode != 0 {
+		c.logger.Warn("server rejected request",
+			"cmd", frame.Cmd,
+			"req_id", frame.Headers.ReqID,
+			"errcode", frame.ErrCode,
+			"errmsg", frame.ErrMsg,
+		)
+		return
+	}
+
 	switch frame.Cmd {
 	case "aibot_msg_callback":
 		var body MsgCallbackBody
@@ -404,13 +424,25 @@ func (c *Client) handleFrame(frame Frame) {
 }
 
 // SendMarkdown 主动发送 markdown 消息到指定会话
-func (c *Client) SendMarkdown(chatID string, chatType uint32, content string) error {
-	return c.enqueue("aibot_send_msg", newReqID(), SendMsgBody{
+func (c *Client) SendMarkdown(ctx context.Context, chatID string, chatType uint32, content string) error {
+	_, err := c.call(ctx, "aibot_send_msg", SendMsgBody{
 		ChatID:   chatID,
 		ChatType: chatType,
 		MsgType:  "markdown",
 		Markdown: &Markdown{Content: content},
 	})
+	return err
+}
+
+// SendVoice 主动发送语音消息到指定会话，mediaID 来自 UploadMedia
+func (c *Client) SendVoice(ctx context.Context, chatID string, chatType uint32, mediaID string) error {
+	_, err := c.call(ctx, "aibot_send_msg", SendMsgBody{
+		ChatID:   chatID,
+		ChatType: chatType,
+		MsgType:  "voice",
+		Voice:    &Voice{MediaID: mediaID},
+	})
+	return err
 }
 
 // RespondMarkdown 被动回复 markdown 消息（回复 aibot_msg_callback）
@@ -436,6 +468,9 @@ func (c *Client) UploadMedia(ctx context.Context, mediaType, filename string, da
 	}
 	if mediaType == "image" && len(data) > MaxImageMediaSize {
 		return "", fmt.Errorf("image too large: %d bytes, max %d", len(data), MaxImageMediaSize)
+	}
+	if mediaType == "voice" && len(data) > MaxVoiceMediaSize {
+		return "", fmt.Errorf("voice too large: %d bytes, max %d", len(data), MaxVoiceMediaSize)
 	}
 	totalChunks := (len(data) + maxChunkSize - 1) / maxChunkSize
 	if totalChunks > maxChunks {

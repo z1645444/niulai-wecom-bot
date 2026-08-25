@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
+
+	"niulai-wecom-bot/internal/wecom"
 )
 
 // 完成后回复类型
@@ -46,6 +49,9 @@ type Config struct {
 
 	// ScreamContent 是触发后向目标群聊发送的喊话内容，默认“妈妈”
 	ScreamContent string
+	// ScreamVoiceFile 是触发后优先发送的语音文件绝对路径；
+	// 文件缺失或上传失败时回退为发送 ScreamContent 文字
+	ScreamVoiceFile string
 	// StopKeyword 是停止指令关键词：文本剥离开头的 @提及 后包含该词即停止，默认“牛来”
 	StopKeyword string
 
@@ -171,6 +177,22 @@ func Load() (*Config, error) {
 		screamContent = DefaultScreamContent
 	}
 
+	voiceFile := strings.TrimSpace(os.Getenv("SCREAM_VOICE_FILE"))
+	if voiceFile != "" {
+		if !filepath.IsAbs(voiceFile) {
+			return nil, fmt.Errorf("SCREAM_VOICE_FILE must be an absolute path, got %q", voiceFile)
+		}
+		// 企业微信语音素材仅支持 amr 格式、不超过 2MB；后缀与体积在启动时校验，
+		// 避免配置错误导致每次喊话都静默回退为文字
+		if !strings.HasSuffix(strings.ToLower(voiceFile), ".amr") {
+			return nil, fmt.Errorf("SCREAM_VOICE_FILE must point to an .amr file, got %q", voiceFile)
+		}
+		// 文件不存在时不报错：保留运行时回退为文字喊话的行为
+		if info, err := os.Stat(voiceFile); err == nil && info.Size() > wecom.MaxVoiceMediaSize {
+			return nil, fmt.Errorf("SCREAM_VOICE_FILE %q too large: %d bytes, max %d", voiceFile, info.Size(), wecom.MaxVoiceMediaSize)
+		}
+	}
+
 	replyType := strings.ToLower(strings.TrimSpace(os.Getenv("FINISH_REPLY_TYPE")))
 	if replyType == "" {
 		replyType = ReplyTypeText
@@ -207,6 +229,7 @@ func Load() (*Config, error) {
 		CooldownMinutes:           cooldown,
 		MaxSendFailures:           maxSendFailures,
 		ScreamContent:             screamContent,
+		ScreamVoiceFile:           voiceFile,
 		StopKeyword:               stopKeyword,
 		ForceTriggerWindowMinutes: forceWindow,
 		FinishReplyType:           replyType,

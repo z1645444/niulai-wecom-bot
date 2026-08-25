@@ -34,6 +34,10 @@
 - 某个群进入 `SCREAMING` 状态后，每隔 `MIN_INTERVAL_SECONDS` 到 `MAX_INTERVAL_SECONDS` 之间的随机秒数向该群发送一次喊话内容；各群的发送循环与间隔相互独立
 - 默认间隔：15 秒到 30 秒
 - 发送内容由 `SCREAM_CONTENT` 指定，默认：`妈妈`
+- 配置 `SCREAM_VOICE_FILE`（语音文件绝对路径）后优先发送语音消息：
+  - 语音先经 `aibot_upload_media_init/chunk/finish` 上传换取 `media_id`，进程内按文件路径缓存；超过 48 小时或同路径文件内容变更后自动重新上传（临时素材有效期 3 天）
+  - 发送请求等待服务端响应；文件缺失、读取、上传失败或发送被服务端拒绝时回退为发送 `SCREAM_CONTENT` 文字
+  - 语音连续失败 3 次后暂停语音尝试 1 小时（期间直接发送文字），到期自动重试，避免服务端持续拒绝语音时每个喊话周期都重新上传
 - 发送目标：
   - 如果配置了 `TARGET_CHAT_ID`，则只向这些会话发送
   - 否则向运行时收集到的所有群聊逐个发送
@@ -68,7 +72,7 @@
 - 回复内容由 `FINISH_REPLY_TYPE` 决定：
   - `text`（默认）：回复 `FINISH_REPLY_TEXT` 指定的文本，默认发送 emoji 🐮
   - `image`：回复 `FINISH_REPLY_IMAGE_URL` 索引的图片，地址支持 http(s) URL 或本地文件路径
-- 图片回复需先经 `aibot_upload_media_init/chunk/finish` 上传临时素材换取 `media_id`；`media_id` 在进程内按地址缓存，重启后重新上传
+- 图片回复需先经 `aibot_upload_media_init/chunk/finish` 上传临时素材换取 `media_id`；`media_id` 在进程内按地址缓存，超过 48 小时自动重新上传（临时素材有效期 3 天）
 - 图片拉取或上传失败时回退为文本回复（`FINISH_REPLY_TEXT`，默认 🐮），保证完成信号可达
 
 ## 8. 冷却规则
@@ -111,6 +115,7 @@
 | `MAX_SEND_FAILURES` | 否 | `3` | 连续发送失败多少次后移除目标群聊 |
 | `FORCE_TRIGGER_WINDOW_MINUTES` | 否 | `30` | 每日保底触发窗口：工作结束前该时长内若有群聊当天未触发则强制触发 |
 | `SCREAM_CONTENT` | 否 | `妈妈` | 触发后向群聊发送的喊话内容 |
+| `SCREAM_VOICE_FILE` | 否 | - | 触发后优先发送的语音文件绝对路径（仅 amr、≤2MB，启动时校验）；文件缺失、读取、上传或发送失败时回退为 `SCREAM_CONTENT` 文字，连续失败 3 次后暂停语音 1 小时 |
 | `STOP_KEYWORD` | 否 | `牛来` | 停止指令关键词：文本剥离开头 @提及 后包含该词即停止；关键词中的空白会被忽略 |
 | `FINISH_REPLY_TYPE` | 否 | `text` | 完成后回复类型：`text` 或 `image` |
 | `FINISH_REPLY_TEXT` | 否 | `🐮` | 文本回复内容；图片回复失败时也用它回退 |
