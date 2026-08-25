@@ -44,9 +44,9 @@
 
 - 机器人从收到的 `aibot_msg_callback` 或 `aibot_event_callback` 中自动收集 `chattype=group` 的 `chatid`
 - 自动收集到的 `chatid` 会增量合并到 `TARGET_CHAT_ID`，已有 ID 不重复添加
-- 收集到的 `chatid` 保存在当前运行配置中，服务重启后需重新加载环境变量或再次发现
+- 目标群聊列表每次变化（自动发现或失败移除）都会同步回写工作目录下的 `.env` 文件（文件不存在时跳过，如纯环境变量部署），重启后仍然有效
 - 企业微信智能机器人目前**不支持**进群/退群事件回调，因此无法主动感知“机器人在哪些群”，只能被动发现产生过交互的群
-- 被连续发送失败 `MAX_SEND_FAILURES` 次的群聊会自动从列表中移除
+- 被连续发送失败 `MAX_SEND_FAILURES` 次的群聊会自动从列表中移除，移除同样回写 `.env`（含手工配置的 ID）；若是网络抖动等临时故障误伤，待该群再产生消息时会被重新发现并再次加入
 
 ## 6. 停止条件
 
@@ -115,7 +115,7 @@
 | `FINISH_REPLY_TYPE` | 否 | `text` | 完成后回复类型：`text` 或 `image` |
 | `FINISH_REPLY_TEXT` | 否 | `🐮` | 文本回复内容；图片回复失败时也用它回退 |
 | `FINISH_REPLY_IMAGE_URL` | 类型为 `image` 时必填 | - | 图片地址索引，支持 http(s) URL 或本地文件路径 |
-| `TARGET_CHAT_ID` | 否 | - | 主动发送目标会话 ID，多个 ID 用逗号分隔；运行期间自动发现的新群聊会增量加入并去重 |
+| `TARGET_CHAT_ID` | 否 | - | 主动发送目标会话 ID，多个 ID 用逗号分隔；运行期间自动发现的新群聊会增量加入并去重，列表变化时回写 `.env`（文件存在时） |
 | `LOG_LEVEL` | 否 | `info` | 日志级别：debug、info、warn、error |
 
 ## 11. WebSocket 协议要点

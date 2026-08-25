@@ -44,6 +44,12 @@ func main() {
 	client := wecom.NewClient(cfg.WeComBotID, cfg.WeComBotSecret, nl, logger)
 	nl.SetClient(client)
 
+	// 目标群聊列表变化（自动发现、失败移除）时回写 .env，与 godotenv 默认
+	// 加载路径一致；文件不存在（纯环境变量部署）时 UpdateEnvFile 直接跳过
+	nl.SetTargetChatIDsPersister(func(value string) error {
+		return config.UpdateEnvFile(".env", "TARGET_CHAT_ID", value)
+	})
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

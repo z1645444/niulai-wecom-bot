@@ -65,6 +65,10 @@ type NiuLai struct {
 	mediaMu    sync.Mutex
 	mediaCache map[string]string
 
+	// persistTargets 在目标群聊列表变化（自动发现、失败移除）后持久化最新的
+	// TARGET_CHAT_ID 值（如回写 .env）；为 nil 时不持久化。须在 Start 前完成设置
+	persistTargets func(value string) error
+
 	// sleep 控制 screamLoop 的等待行为，便于测试注入
 	sleep func(context.Context, time.Duration) bool
 
@@ -190,6 +194,24 @@ func (nl *NiuLai) Stop() {
 // SetClient 注入 WebSocket 客户端，解决初始化时的循环依赖
 func (nl *NiuLai) SetClient(client Sender) {
 	nl.client = client
+}
+
+// SetTargetChatIDsPersister 注册目标群聊列表的持久化回调，
+// 在自动发现新群聊或群聊被移出目标列表时调用
+func (nl *NiuLai) SetTargetChatIDsPersister(fn func(value string) error) {
+	nl.persistTargets = fn
+}
+
+// persistTargetChatIDsLocked 把当前 TARGET_CHAT_ID 交给持久化回调，失败仅记日志。
+// 调用方必须持有 chatsMu：写回顺序与配置变更顺序一致，
+// 避免并发变更下旧值覆盖新值
+func (nl *NiuLai) persistTargetChatIDsLocked() {
+	if nl.persistTargets == nil {
+		return
+	}
+	if err := nl.persistTargets(nl.cfg.TargetChatID); err != nil {
+		nl.logger.Warn("failed to persist target chat ids", "err", err)
+	}
 }
 
 // OnMessage 实现 wecom.Handler，处理收到的用户消息。
@@ -390,6 +412,7 @@ func (nl *NiuLai) captureChatID(chatType, chatID string) {
 	nl.chats[chatID] = struct{}{}
 	configuredIDs = append(configuredIDs, chatID)
 	nl.cfg.TargetChatID = config.FormatTargetChatIDs(configuredIDs)
+	nl.persistTargetChatIDsLocked()
 	nl.logger.Info("auto-captured target group chatid", "chatid", chatID)
 }
 
@@ -615,6 +638,7 @@ func (nl *NiuLai) recordSendFailure(chatID string) int {
 				delete(nl.chats, chatID)
 			}
 			nl.cfg.TargetChatID = config.FormatTargetChatIDs(remaining)
+			nl.persistTargetChatIDsLocked()
 			nl.failuresMu.Lock()
 			delete(nl.failures, chatID)
 			nl.failuresMu.Unlock()

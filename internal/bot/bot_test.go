@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1304,4 +1305,81 @@ func TestStartIsIdempotent(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	nl.Stop()
 	nl.Stop() // 重复 Stop 应安全
+}
+
+func TestCaptureChatIDPersistsTargets(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	nl := New(&config.Config{CooldownMinutes: 1, TargetChatID: "configured"}, nil, logger)
+
+	var mu sync.Mutex
+	var persisted []string
+	nl.SetTargetChatIDsPersister(func(value string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		persisted = append(persisted, value)
+		return nil
+	})
+
+	nl.captureChatID("group", "chat-1")
+	nl.captureChatID("group", "chat-1") // 重复发现不再写回
+	nl.captureChatID("group", "chat-2")
+	nl.captureChatID("single", "chat-3") // 非群聊不触发写回
+
+	want := []string{"configured,chat-1", "configured,chat-1,chat-2"}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(persisted) != len(want) {
+		t.Fatalf("persisted = %v, want %v", persisted, want)
+	}
+	for i := range want {
+		if persisted[i] != want[i] {
+			t.Fatalf("persisted[%d] = %q, want %q", i, persisted[i], want[i])
+		}
+	}
+}
+
+func TestFailureEvictionPersistsTargets(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	fake := &fakeSender{failSend: true}
+	nl := New(&config.Config{CooldownMinutes: 1, MaxSendFailures: 1}, fake, logger)
+	nl.SetClient(fake)
+
+	var mu sync.Mutex
+	var persisted []string
+	nl.SetTargetChatIDsPersister(func(value string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		persisted = append(persisted, value)
+		return nil
+	})
+
+	nl.captureChatID("group", "chat-1")
+	nl.captureChatID("group", "chat-2")
+	nl.sendScream("chat-1") // 连续失败达到上限，chat-1 被移出
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"chat-1", "chat-1,chat-2", "chat-2"}
+	if len(persisted) != len(want) {
+		t.Fatalf("persisted = %v, want %v", persisted, want)
+	}
+	for i := range want {
+		if persisted[i] != want[i] {
+			t.Fatalf("persisted[%d] = %q, want %q", i, persisted[i], want[i])
+		}
+	}
+}
+
+func TestPersistErrorDoesNotAffectCapture(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	nl := New(&config.Config{CooldownMinutes: 1}, nil, logger)
+	nl.SetTargetChatIDsPersister(func(value string) error {
+		return fmt.Errorf("disk full")
+	})
+
+	nl.captureChatID("group", "chat-1")
+
+	if got := nl.targetChatIDs(); len(got) != 1 || got[0] != "chat-1" {
+		t.Fatalf("targets = %v, want [chat-1]", got)
+	}
 }
